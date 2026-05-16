@@ -2,7 +2,8 @@ import React, { useEffect, useState } from 'react';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { StatusBar } from 'expo-status-bar';
-import { ActivityIndicator, View } from 'react-native';
+import * as NavigationBar from 'expo-navigation-bar';
+import { ActivityIndicator, View, Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import LoginScreen from './src/screens/LoginScreen';
@@ -33,6 +34,19 @@ export default function App() {
       }
     }
     init();
+
+    // Hide navigation bar on Android for immersive mode
+    if (Platform.OS === 'android') {
+      const hideNavBar = async () => {
+        try {
+          await NavigationBar.setVisibilityAsync('hidden');
+          await NavigationBar.setBehaviorAsync('inset-swipe');
+        } catch (e) {
+          console.log('Error hiding navigation bar:', e);
+        }
+      };
+      hideNavBar();
+    }
   }, []);
 
   if (!initialRoute) {
