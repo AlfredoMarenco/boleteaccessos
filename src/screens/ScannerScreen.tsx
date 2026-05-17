@@ -3,6 +3,7 @@ import { View, Text, StyleSheet, TouchableOpacity, TextInput, Vibration, Image, 
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
+import { Audio } from 'expo-av';
 
 import { validateCodeLocally, getUnsyncedLogs, markLogsAsSynced, updateCodesStatus } from '../services/database';
 import { syncLogs, getDeltas, validateCodeOnline } from '../services/accessService';
@@ -125,6 +126,30 @@ export default function ScannerScreen({ navigation }: any) {
     }
   };
 
+  const playSound = async (soundType: 'success' | 'error' | 'warning') => {
+    try {
+      let soundAsset;
+      if (soundType === 'success') {
+        soundAsset = require('../assets/sounds/success.mp3');
+      } else if (soundType === 'error') {
+        soundAsset = require('../assets/sounds/error.mp3');
+      } else {
+        soundAsset = require('../assets/sounds/warning.mp3');
+      }
+
+      const { sound } = await Audio.Sound.createAsync(
+        soundAsset,
+        { shouldPlay: true }
+      );
+      
+      setTimeout(() => {
+        sound.unloadAsync().catch(() => {});
+      }, 3000);
+    } catch (error) {
+      console.log('Error playing sound:', error);
+    }
+  };
+
   const handleProcessCode = async (code: string) => {
     if (scanned) return;
     setScanned(true);
@@ -161,11 +186,16 @@ export default function ScannerScreen({ navigation }: any) {
     
     if (validationResult.status === 'success') {
       Vibration.vibrate(100);
+      playSound('success');
       setTimeout(() => {
         resetScanner();
       }, 1500);
+    } else if (validationResult.status === 'invalid_zone') {
+      Vibration.vibrate([0, 200, 100, 200]);
+      playSound('warning');
     } else {
       Vibration.vibrate([0, 200, 100, 200]); 
+      playSound('error');
     }
 
     setLaserInput('');
