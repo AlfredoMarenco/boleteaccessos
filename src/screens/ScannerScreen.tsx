@@ -163,7 +163,7 @@ export default function ScannerScreen({ navigation }: any) {
       Vibration.vibrate(100);
       setTimeout(() => {
         resetScanner();
-      }, 800);
+      }, 1500);
     } else {
       Vibration.vibrate([0, 200, 100, 200]); 
     }

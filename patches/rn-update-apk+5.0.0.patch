@@ -1,0 +1,23 @@
+diff --git a/node_modules/rn-update-apk/android/src/main/java/net/mikehardy/rnupdateapk/RNUpdateAPK.java b/node_modules/rn-update-apk/android/src/main/java/net/mikehardy/rnupdateapk/RNUpdateAPK.java
+--- a/node_modules/rn-update-apk/android/src/main/java/net/mikehardy/rnupdateapk/RNUpdateAPK.java
++++ b/node_modules/rn-update-apk/android/src/main/java/net/mikehardy/rnupdateapk/RNUpdateAPK.java
+@@ -141,12 +141,16 @@
+                 Log.e("RNUpdateAPK", "installApk exception with authority name '" + fileProviderAuthority + "'", e);
+                 throw e;
+             }
+-            Intent installApp = new Intent(Intent.ACTION_INSTALL_PACKAGE);
++            Intent installApp = new Intent(Intent.ACTION_VIEW);
+             installApp.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+             installApp.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+-            installApp.setData(contentUri);
++            installApp.setDataAndType(contentUri, "application/vnd.android.package-archive");
+             installApp.putExtra(Intent.EXTRA_INSTALLER_PACKAGE_NAME, reactContext.getApplicationInfo().packageName);
+-            reactContext.startActivity(installApp);
++            try {
++                reactContext.startActivity(installApp);
++            } catch (Exception e) {
++                Log.e("RNUpdateAPK", "Failed to start install activity", e);
++            }
+         } else {
+             // Old APIs do not handle content:// URIs, so use an old file:// style
+             String cmd = "chmod 777 " + file;
