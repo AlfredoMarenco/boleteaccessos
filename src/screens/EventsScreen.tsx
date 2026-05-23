@@ -18,9 +18,10 @@ export default function EventsScreen({ navigation }: any) {
     try {
       const data = await getEvents();
       setEvents(data);
-    } catch (error) {
+    } catch (error: any) {
       console.error(error);
-      Alert.alert('Error', 'No se pudieron cargar los eventos activos.');
+      const errorMsg = error.response?.data?.message || error.response?.data || error.message || 'Error desconocido';
+      Alert.alert('Error al cargar eventos', `Detalle: ${errorMsg}`);
     } finally {
       setLoading(false);
     }

@@ -43,9 +43,10 @@ export default function SyncScreen({ navigation }: any) {
       } else {
         Alert.alert('Aviso', 'El evento no tiene boletos registrados.');
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error(error);
-      Alert.alert('Error', 'No se pudieron descargar los boletos.');
+      const errorMsg = error.response?.data?.message || error.response?.data || error.message || 'Error desconocido';
+      Alert.alert('Error', `No se pudieron descargar los boletos. Detalle: ${errorMsg}`);
     } finally {
       setLoadingDown(false);
     }
@@ -75,9 +76,10 @@ export default function SyncScreen({ navigation }: any) {
       
       setUnsyncedCount(0);
       Alert.alert('Éxito', `${data.synced_count} escaneos sincronizados al servidor.`);
-    } catch (error) {
+    } catch (error: any) {
       console.error(error);
-      Alert.alert('Error', 'No se pudieron sincronizar los escaneos.');
+      const errorMsg = error.response?.data?.message || error.response?.data || error.message || 'Error desconocido';
+      Alert.alert('Error', `No se pudieron sincronizar los escaneos. Detalle: ${errorMsg}`);
     } finally {
       setLoadingUp(false);
     }

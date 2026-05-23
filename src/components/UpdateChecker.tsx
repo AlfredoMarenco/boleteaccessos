@@ -6,6 +6,7 @@ import {
   TouchableOpacity,
   StyleSheet,
   ActivityIndicator,
+  NativeModules,
 } from 'react-native';
 import { UpdateAPK } from 'rn-update-apk';
 import { DownloadCloud } from 'lucide-react-native';
@@ -23,6 +24,12 @@ export default function UpdateChecker() {
   );
 
   useEffect(() => {
+    // Evitar que la app crasheé en Expo Go o desarrollo si el módulo nativo no está cargado
+    if (!NativeModules.RNUpdateAPK) {
+      console.warn('Módulo nativo RNUpdateAPK no disponible (normal en Expo Go o emuladores). Omitiendo actualización.');
+      return;
+    }
+
     const updater = new UpdateAPK({
       apkVersionUrl: API_ENDPOINTS.checkApk,
       fileProviderAuthority: 'com.boletea.accessos.fileprovider',
