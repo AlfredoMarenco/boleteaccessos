@@ -33,8 +33,9 @@
     ],
     "extra": {
       "eas": {
-        "projectId": "e4a599a1-0ff4-4dea-894f-dadea85a62f8"
+        "projectId": "c48cf5de-cfa0-430d-b0c0-cfebf365e4cd"
       }
-    }
+    },
+    "owner": "marencocode2"
   }
 }

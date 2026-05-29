@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, TextInput, Vibration, Image, StatusBar } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, TextInput, Vibration, Image, StatusBar, ScrollView } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
 import { Audio } from 'expo-av';
 
-import { validateCodeLocally, getUnsyncedLogs, markLogsAsSynced, updateCodesStatus } from '../services/database';
+import { validateCodeLocally, getUnsyncedLogs, markLogsAsSynced, updateCodesStatus, getDb } from '../services/database';
 import { syncLogs, getDeltas, validateCodeOnline } from '../services/accessService';
 import { colors } from '../theme/colors';
 import { CheckCircle, XCircle, AlertTriangle, CloudOff, CloudUpload, Camera, ArrowLeft, RefreshCcw } from 'lucide-react-native';
@@ -156,22 +156,88 @@ export default function ScannerScreen({ navigation }: any) {
 
     let validationResult;
 
+    // 1. Pre-check local de sección (candado) tanto online como offline
+    if (allowedSections && allowedSections.length > 0) {
+      const localDb = getDb();
+      if (localDb) {
+        try {
+          const codeRow = await localDb.getFirstAsync<{ metadata: string }>(
+            'SELECT metadata FROM codes WHERE code = ?',
+            [code]
+          );
+          if (codeRow) {
+            const metadata = JSON.parse(codeRow.metadata || '{}');
+            const codeSection = metadata?.details ?? '';
+            if (!allowedSections.includes(codeSection)) {
+              await localDb.runAsync('INSERT INTO logs (code, result, scanned_at) VALUES (?, ?, ?)', [code, 'invalid_zone', new Date().toISOString()]);
+              validationResult = {
+                status: 'invalid_zone',
+                message: `Acceso denegado. Este código pertenece a la zona '${codeSection}', la cual no está habilitada para esta puerta.`,
+              };
+              setResult(validationResult);
+              Vibration.vibrate([0, 200, 100, 200]);
+              playSound('warning');
+              setLaserInput('');
+              refreshUnsyncedCount();
+              attemptAutoSync();
+              return;
+            }
+          }
+        } catch (dbError) {
+          console.log('Error local pre-check:', dbError);
+        }
+      }
+    }
+
     if (isConnected && eventId) {
         try {
             const response = await validateCodeOnline(eventId, code, new Date().toISOString());
             
-            validationResult = response;
-            if (validationResult.status === 'success') {
+            // 2. Post-check online de sección (candado) con metadatos del servidor (por si no está en la DB local)
+            if (response.status === 'success' && allowedSections && allowedSections.length > 0) {
+              const metadata = response.metadata || {};
+              const codeSection = metadata.details ?? '';
+              if (!allowedSections.includes(codeSection)) {
+                validationResult = {
+                  status: 'invalid_zone',
+                  message: `Acceso denegado. Este código pertenece a la zona '${codeSection}', la cual no está habilitada para esta puerta.`,
+                };
+                const localDb = getDb();
+                if (localDb) {
+                  await localDb.runAsync('INSERT INTO logs (code, result, scanned_at) VALUES (?, ?, ?)', [code, 'invalid_zone', new Date().toISOString()]);
+                }
+              } else {
+                validationResult = response;
                 await updateCodesStatus([{ code, status: 'used' }]);
+              }
+            } else {
+              validationResult = response;
+              if (validationResult.status === 'success') {
+                await updateCodesStatus([{ code, status: 'used' }]);
+              }
             }
         } catch (error: any) {
             console.log('Online validation error:', error.message);
             if (error.response && error.response.data && error.response.data.status) {
                 validationResult = error.response.data;
-                if (validationResult.status === 'duplicate') {
-                    await updateCodesStatus([{ code, status: 'used' }]);
-                } else if (validationResult.status === 'cancelled') {
-                    await updateCodesStatus([{ code, status: 'cancelled' }]);
+                // Si el servidor responde duplicado o cancelado, también validamos sección si viene en la respuesta
+                const metadata = validationResult.metadata || {};
+                const codeSection = metadata.details ?? '';
+                if (allowedSections && allowedSections.length > 0 && codeSection && !allowedSections.includes(codeSection)) {
+                  validationResult = {
+                    status: 'invalid_zone',
+                    message: `Acceso denegado. Este código pertenece a la zona '${codeSection}', la cual no está habilitada para esta puerta.`,
+                  };
+                  const localDb = getDb();
+                  if (localDb) {
+                    await localDb.runAsync('INSERT INTO logs (code, result, scanned_at) VALUES (?, ?, ?)', [code, 'invalid_zone', new Date().toISOString()]);
+                  }
+                } else {
+                  if (validationResult.status === 'duplicate') {
+                      await updateCodesStatus([{ code, status: 'used' }]);
+                  } else if (validationResult.status === 'cancelled') {
+                      await updateCodesStatus([{ code, status: 'cancelled' }]);
+                  }
                 }
             } else {
                 console.log('Connection error during online validation, falling back to local');
@@ -276,46 +342,52 @@ export default function ScannerScreen({ navigation }: any) {
 
     return (
       <View style={[StyleSheet.absoluteFillObject, styles.resultOverlay, { backgroundColor: bgColor }]}>
-        <View style={styles.resultHeader}>
-            <Icon color="#fff" size={120} />
-            <Text style={styles.resultTitle}>{title}</Text>
-        </View>
+        <ScrollView 
+          style={{ flex: 1, width: '100%' }}
+          contentContainerStyle={styles.resultScrollContent}
+          showsVerticalScrollIndicator={false}
+        >
+          <View style={styles.resultHeader}>
+              <Icon color="#fff" size={80} />
+              <Text style={styles.resultTitle}>{title}</Text>
+          </View>
 
-        <View style={styles.resultBody}>
-            <Text style={styles.resultMessage}>{instructions}</Text>
-            
-            {highlightTitle ? (
-              <View style={styles.actionBox}>
-                <Text style={styles.actionLabel}>{highlightTitle}</Text>
-                <Text style={[styles.actionText, { color: highlightColor }]}>{highlightText}</Text>
-              </View>
-            ) : null}
-            
-            {result.duplicate_info ? (
-              <View style={styles.duplicateBox}>
-                <Text style={styles.duplicateLabel}>ESTE BOLETO SE USÓ EN:</Text>
-                <Text style={styles.duplicateText}>
-                  Hora: {new Date(result.duplicate_info.scanned_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                </Text>
-                <Text style={styles.duplicateText}>
-                  Puerta: {result.duplicate_info.device_name}
-                </Text>
-              </View>
-            ) : null}
+          <View style={styles.resultBody}>
+              <Text style={styles.resultMessage}>{instructions}</Text>
+              
+              {highlightTitle ? (
+                <View style={styles.actionBox}>
+                  <Text style={styles.actionLabel}>{highlightTitle}</Text>
+                  <Text style={[styles.actionText, { color: highlightColor }]}>{highlightText}</Text>
+                </View>
+              ) : null}
+              
+              {result.duplicate_info ? (
+                <View style={styles.duplicateBox}>
+                  <Text style={styles.duplicateLabel}>ESTE BOLETO SE USÓ EN:</Text>
+                  <Text style={styles.duplicateText}>
+                    Hora: {new Date(result.duplicate_info.scanned_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                  </Text>
+                  <Text style={styles.duplicateText}>
+                    Puerta: {result.duplicate_info.device_name}
+                  </Text>
+                </View>
+              ) : null}
 
-            {result.metadata && result.metadata.owner ? (
-              <View style={styles.metaBox}>
-                <Text style={styles.metaLabel}>TITULAR DEL BOLETO</Text>
-                <Text style={styles.resultMeta}>{result.metadata.owner}</Text>
-              </View>
-            ) : null}
+              {result.metadata && result.metadata.owner ? (
+                <View style={styles.metaBox}>
+                  <Text style={styles.metaLabel}>TITULAR DEL BOLETO</Text>
+                  <Text style={styles.resultMeta}>{result.metadata.owner}</Text>
+                </View>
+              ) : null}
 
-            {result.type ? (
-              <View style={styles.typeBox}>
-                <Text style={styles.resultType}>{result.type}</Text>
-              </View>
-            ) : null}
-        </View>
+              {result.type ? (
+                <View style={styles.typeBox}>
+                  <Text style={styles.resultType}>{result.type}</Text>
+                </View>
+              ) : null}
+          </View>
+        </ScrollView>
         
         {result.status !== 'success' ? (
           <View style={styles.resultFooter}>
@@ -363,9 +435,18 @@ export default function ScannerScreen({ navigation }: any) {
       <View style={styles.overlay} pointerEvents="box-none">
         <View style={styles.topBar}>
           <View style={{ width: 40 }} />
-          <View style={{ flex: 1 }} />
+          {!isConnected ? (
+            <View style={styles.offlineBadge}>
+              <CloudOff color="#fff" size={16} />
+              <Text style={styles.offlineBadgeText}>SIN INTERNET (MODO LOCAL)</Text>
+            </View>
+          ) : (
+            <View style={{ flex: 1 }} />
+          )}
           <View style={{ width: 40, alignItems: 'flex-end' }}>
-            {!isConnected ? <CloudOff color={colors.danger} size={24} /> : null}
+            {isConnected ? (
+              <View style={styles.onlineDot} />
+            ) : null}
           </View>
         </View>
         {isCameraActive ? (
@@ -424,28 +505,51 @@ const styles = StyleSheet.create({
   },
   syncBadgeText: { color: colors.warning, fontWeight: 'bold', marginLeft: 8 },
   hiddenInput: { position: 'absolute', top: -100, left: -100, width: 1, height: 1, opacity: 0 },
-  resultOverlay: { flex: 1, padding: 30, zIndex: 1000, justifyContent: 'center' },
-  resultHeader: { alignItems: 'center', marginBottom: 30 },
-  resultTitle: { color: '#fff', fontSize: 36, fontWeight: '900', marginTop: 15, textAlign: 'center' },
-  resultBody: { alignItems: 'center', marginBottom: 40 },
-  resultMessage: { color: 'rgba(255,255,255,0.9)', fontSize: 18, textAlign: 'center', marginBottom: 15, fontWeight: '500' },
-  actionBox: { backgroundColor: 'rgba(0,0,0,0.4)', paddingVertical: 20, paddingHorizontal: 15, borderRadius: 16, width: '100%', alignItems: 'center', marginBottom: 20, borderWidth: 2, borderColor: 'rgba(255,255,255,0.1)' },
-  actionLabel: { color: 'rgba(255,255,255,0.7)', fontSize: 13, fontWeight: '900', letterSpacing: 1.5, marginBottom: 8 },
-  actionText: { fontSize: 28, fontWeight: '900', textAlign: 'center', textTransform: 'uppercase' },
-  duplicateBox: { backgroundColor: 'rgba(0,0,0,0.5)', padding: 15, borderRadius: 12, width: '100%', alignItems: 'center', marginBottom: 15 },
-  duplicateLabel: { color: colors.warning, fontSize: 12, fontWeight: 'bold', marginBottom: 5, letterSpacing: 1 },
-  duplicateText: { color: '#fff', fontSize: 16, fontWeight: '600', marginBottom: 2 },
-  metaBox: { backgroundColor: 'rgba(255,255,255,0.2)', padding: 15, borderRadius: 12, width: '100%', alignItems: 'center', marginBottom: 15 },
-  metaLabel: { color: 'rgba(255,255,255,0.7)', fontSize: 12, fontWeight: 'bold', marginBottom: 5 },
-  resultMeta: { color: '#fff', fontSize: 24, fontWeight: 'bold', textAlign: 'center' },
-  typeBox: { backgroundColor: 'rgba(0,0,0,0.3)', paddingHorizontal: 20, paddingVertical: 10, borderRadius: 30 },
-  resultType: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
-  resultFooter: { alignItems: 'center', width: '100%' },
+  offlineBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#e11d48',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 20,
+    gap: 6,
+    alignSelf: 'center',
+  },
+  offlineBadgeText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: 'bold',
+    letterSpacing: 0.5,
+  },
+  onlineDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: colors.success,
+  },
+  resultOverlay: { flex: 1, padding: 15, zIndex: 1000, justifyContent: 'center' },
+  resultScrollContent: { alignItems: 'center', paddingVertical: 20 },
+  resultHeader: { alignItems: 'center', marginBottom: 15 },
+  resultTitle: { color: '#fff', fontSize: 26, fontWeight: '900', marginTop: 10, textAlign: 'center' },
+  resultBody: { alignItems: 'center', marginBottom: 20, width: '100%' },
+  resultMessage: { color: 'rgba(255,255,255,0.9)', fontSize: 16, textAlign: 'center', marginBottom: 10, fontWeight: '500' },
+  actionBox: { backgroundColor: 'rgba(0,0,0,0.4)', paddingVertical: 12, paddingHorizontal: 12, borderRadius: 12, width: '100%', alignItems: 'center', marginBottom: 12, borderWidth: 2, borderColor: 'rgba(255,255,255,0.1)' },
+  actionLabel: { color: 'rgba(255,255,255,0.7)', fontSize: 11, fontWeight: '900', letterSpacing: 1.5, marginBottom: 5 },
+  actionText: { fontSize: 22, fontWeight: '900', textAlign: 'center', textTransform: 'uppercase' },
+  duplicateBox: { backgroundColor: 'rgba(0,0,0,0.5)', padding: 12, borderRadius: 10, width: '100%', alignItems: 'center', marginBottom: 12 },
+  duplicateLabel: { color: colors.warning, fontSize: 11, fontWeight: 'bold', marginBottom: 4, letterSpacing: 1 },
+  duplicateText: { color: '#fff', fontSize: 14, fontWeight: '600', marginBottom: 2 },
+  metaBox: { backgroundColor: 'rgba(255,255,255,0.2)', padding: 12, borderRadius: 10, width: '100%', alignItems: 'center', marginBottom: 12 },
+  metaLabel: { color: 'rgba(255,255,255,0.7)', fontSize: 11, fontWeight: 'bold', marginBottom: 4 },
+  resultMeta: { color: '#fff', fontSize: 20, fontWeight: 'bold', textAlign: 'center' },
+  typeBox: { backgroundColor: 'rgba(0,0,0,0.3)', paddingHorizontal: 16, paddingVertical: 8, borderRadius: 25 },
+  resultType: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
+  resultFooter: { alignItems: 'center', width: '100%', marginTop: 10 },
   btnNext: { 
     flexDirection: 'row',
     backgroundColor: 'rgba(255,255,255,0.25)', 
-    paddingVertical: 18, 
-    paddingHorizontal: 30,
+    paddingVertical: 14, 
+    paddingHorizontal: 25,
     borderRadius: 50, 
     alignItems: 'center',
     justifyContent: 'center',
@@ -453,6 +557,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.5)',
   },
-  btnNextText: { color: '#fff', fontSize: 18, fontWeight: 'bold', marginLeft: 10 },
-  triggerHint: { color: 'rgba(255,255,255,0.7)', fontSize: 14, marginTop: 15, fontStyle: 'italic' },
+  btnNextText: { color: '#fff', fontSize: 16, fontWeight: 'bold', marginLeft: 10 },
+  triggerHint: { color: 'rgba(255,255,255,0.7)', fontSize: 12, marginTop: 10, fontStyle: 'italic' },
 });

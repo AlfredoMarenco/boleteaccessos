@@ -18,6 +18,7 @@
     "expo": "~54.0.33",
     "expo-av": "~16.0.8",
     "expo-camera": "~17.0.10",
+    "expo-keep-awake": "^56.0.3",
     "expo-navigation-bar": "~5.0.10",
     "expo-sqlite": "~16.0.10",
     "expo-status-bar": "~3.0.9",

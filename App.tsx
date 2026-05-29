@@ -5,6 +5,7 @@ import { StatusBar } from 'expo-status-bar';
 import * as NavigationBar from 'expo-navigation-bar';
 import { ActivityIndicator, View, Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useKeepAwake } from 'expo-keep-awake';
 
 import LoginScreen from './src/screens/LoginScreen';
 import EventsScreen from './src/screens/EventsScreen';
@@ -18,6 +19,7 @@ import { colors } from './src/theme/colors';
 const Stack = createNativeStackNavigator();
 
 export default function App() {
+  useKeepAwake();
   const [initialRoute, setInitialRoute] = useState<string | null>(null);
 
   useEffect(() => {
