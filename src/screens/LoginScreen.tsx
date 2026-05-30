@@ -5,6 +5,7 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import { loginDevice } from '../services/accessService';
 import { colors } from '../theme/colors';
 import { QrCode, X } from 'lucide-react-native';
+import packageJson from '../../package.json';
 
 const logo = require('../assets/logoBoletea.png');
 
@@ -149,6 +150,7 @@ export default function LoginScreen({ navigation }: any) {
           <Text style={styles.qrButtonText}>Escanear Código QR</Text>
         </TouchableOpacity>
       </View>
+      <Text style={styles.versionText}>v{packageJson.version}</Text>
     </ScrollView>
   );
 }
@@ -268,5 +270,13 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: 'bold',
     textAlign: 'center',
+  },
+  versionText: {
+    color: colors.textMuted,
+    fontSize: 13,
+    textAlign: 'center',
+    marginTop: 20,
+    marginBottom: 10,
+    fontWeight: '500',
   },
 });

@@ -4,14 +4,29 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getEvents } from '../services/accessService';
 import { colors } from '../theme/colors';
 import { LogOut, Calendar } from 'lucide-react-native';
+import packageJson from '../../package.json';
 
 export default function EventsScreen({ navigation }: any) {
   const [events, setEvents] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [deviceIdentifier, setDeviceIdentifier] = useState('');
 
   useEffect(() => {
     loadEvents();
+    loadDeviceInfo();
   }, []);
+
+  const loadDeviceInfo = async () => {
+    try {
+      const info = await AsyncStorage.getItem('device_info');
+      if (info) {
+        const parsed = JSON.parse(info);
+        setDeviceIdentifier(parsed.device_identifier || parsed.name || 'Dispositivo');
+      }
+    } catch (e) {
+      console.log('Error loading device info:', e);
+    }
+  };
 
   const loadEvents = async () => {
     setLoading(true);
@@ -54,7 +69,10 @@ export default function EventsScreen({ navigation }: any) {
   return (
     <View style={styles.container}>
       <View style={styles.header}>
-        <Text style={styles.title}>Eventos Activos</Text>
+        <View>
+          <Text style={styles.title}>Eventos Activos</Text>
+          {deviceIdentifier ? <Text style={styles.deviceLabel}>ID Dispositivo: {deviceIdentifier}</Text> : null}
+        </View>
         <TouchableOpacity onPress={handleLogout} style={styles.logoutBtn}>
           <LogOut color={colors.danger} size={24} />
         </TouchableOpacity>
@@ -75,6 +93,7 @@ export default function EventsScreen({ navigation }: any) {
           onRefresh={loadEvents}
         />
       )}
+      <Text style={styles.versionText}>v{packageJson.version}</Text>
     </View>
   );
 }
@@ -98,6 +117,12 @@ const styles = StyleSheet.create({
     fontSize: 24,
     fontWeight: 'bold',
     color: colors.text,
+  },
+  deviceLabel: {
+    color: colors.textMuted,
+    fontSize: 13,
+    marginTop: 4,
+    fontWeight: '500',
   },
   logoutBtn: {
     padding: 8,
@@ -140,5 +165,12 @@ const styles = StyleSheet.create({
     color: colors.textMuted,
     marginTop: 40,
     fontSize: 16,
+  },
+  versionText: {
+    color: colors.textMuted,
+    fontSize: 12,
+    textAlign: 'center',
+    marginVertical: 12,
+    fontWeight: '500',
   },
 });

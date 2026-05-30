@@ -5,16 +5,31 @@ import { syncCodes, syncLogs } from '../services/accessService';
 import { insertCodesBatch, getUnsyncedLogs, markLogsAsSynced } from '../services/database';
 import { colors } from '../theme/colors';
 import { DownloadCloud, UploadCloud, QrCode } from 'lucide-react-native';
+import packageJson from '../../package.json';
 
 export default function SyncScreen({ navigation }: any) {
   const [event, setEvent] = useState<any>(null);
   const [loadingDown, setLoadingDown] = useState(false);
   const [loadingUp, setLoadingUp] = useState(false);
   const [unsyncedCount, setUnsyncedCount] = useState(0);
+  const [deviceIdentifier, setDeviceIdentifier] = useState('');
 
   useEffect(() => {
     loadEventData();
+    loadDeviceInfo();
   }, []);
+
+  const loadDeviceInfo = async () => {
+    try {
+      const info = await AsyncStorage.getItem('device_info');
+      if (info) {
+        const parsed = JSON.parse(info);
+        setDeviceIdentifier(parsed.device_identifier || parsed.name || 'Dispositivo');
+      }
+    } catch (e) {
+      console.log('Error loading device info:', e);
+    }
+  };
 
   const loadEventData = async () => {
     const eventStr = await AsyncStorage.getItem('selected_event');
@@ -91,6 +106,7 @@ export default function SyncScreen({ navigation }: any) {
         <View style={styles.header}>
           <Text style={styles.subtitle}>Evento Seleccionado:</Text>
           <Text style={styles.title}>{event.name}</Text>
+          {deviceIdentifier ? <Text style={styles.deviceSubtitle}>ID Dispositivo: {deviceIdentifier}</Text> : null}
         </View>
       )}
 
@@ -124,6 +140,7 @@ export default function SyncScreen({ navigation }: any) {
         <QrCode color={colors.background} size={24} />
         <Text style={styles.scanButtonText}>INICIAR ESCÁNER</Text>
       </TouchableOpacity>
+      <Text style={styles.versionText}>v{packageJson.version}</Text>
     </ScrollView>
   );
 }
@@ -141,6 +158,12 @@ const styles = StyleSheet.create({
   subtitle: {
     fontSize: 14,
     color: colors.textMuted,
+  },
+  deviceSubtitle: {
+    fontSize: 14,
+    color: colors.textMuted,
+    marginTop: 4,
+    fontWeight: '500',
   },
   title: {
     fontSize: 26,
@@ -204,5 +227,13 @@ const styles = StyleSheet.create({
     fontSize: 18,
     marginLeft: 12,
     letterSpacing: 1,
+  },
+  versionText: {
+    color: colors.textMuted,
+    fontSize: 12,
+    textAlign: 'center',
+    marginTop: 10,
+    marginBottom: 20,
+    fontWeight: '500',
   },
 });

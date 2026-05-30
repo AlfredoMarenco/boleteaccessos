@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, TextInput, Vibration, Image, StatusBar, ScrollView } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, TextInput, Vibration, Image, StatusBar, ScrollView, Platform, ActivityIndicator } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as NavigationBar from 'expo-navigation-bar';
 import NetInfo from '@react-native-community/netinfo';
 import { Audio } from 'expo-av';
 
@@ -9,6 +10,7 @@ import { validateCodeLocally, getUnsyncedLogs, markLogsAsSynced, updateCodesStat
 import { syncLogs, getDeltas, validateCodeOnline } from '../services/accessService';
 import { colors } from '../theme/colors';
 import { CheckCircle, XCircle, AlertTriangle, CloudOff, CloudUpload, Camera, ArrowLeft, RefreshCcw } from 'lucide-react-native';
+import packageJson from '../../package.json';
 
 const logo = require('../assets/logoBoletea.png');
 
@@ -25,8 +27,10 @@ export default function ScannerScreen({ navigation }: any) {
   const [unsyncedCount, setUnsyncedCount] = useState(0);
   const [isSyncing, setIsSyncing] = useState(false);
   const [isConnected, setIsConnected] = useState<boolean | null>(true);
+  const [deviceIdentifier, setDeviceIdentifier] = useState('');
 
   const inputRef = useRef<TextInput>(null);
+  const isValidatingRef = useRef(false);
 
   useEffect(() => {
     const loadEvent = async () => {
@@ -38,6 +42,11 @@ export default function ScannerScreen({ navigation }: any) {
       if (sectionsStr) {
         const parsed = JSON.parse(sectionsStr);
         setAllowedSections(Array.isArray(parsed) ? parsed : null);
+      }
+      const info = await AsyncStorage.getItem('device_info');
+      if (info) {
+        const parsed = JSON.parse(info);
+        setDeviceIdentifier(parsed.device_identifier || parsed.name || 'Dispositivo');
       }
       refreshUnsyncedCount();
     };
@@ -69,6 +78,29 @@ export default function ScannerScreen({ navigation }: any) {
     }, 1000);
     return () => clearInterval(interval);
   }, [scanned]);
+
+  useEffect(() => {
+    if (Platform.OS === 'android') {
+      const hideNavBar = async () => {
+        try {
+          await NavigationBar.setBehaviorAsync('overlay-swipe');
+          await NavigationBar.setVisibilityAsync('hidden');
+        } catch (e) {
+          console.log('Error hiding navigation bar:', e);
+        }
+      };
+      hideNavBar();
+      
+      const subscription = NavigationBar.addVisibilityListener(({ visibility }) => {
+        if (visibility === 'visible') {
+          setTimeout(() => {
+            NavigationBar.setVisibilityAsync('hidden').catch(() => {});
+          }, 1000);
+        }
+      });
+      return () => subscription.remove();
+    }
+  }, []);
 
   const refreshUnsyncedCount = async () => {
     const logs = await getUnsyncedLogs();
@@ -150,42 +182,80 @@ export default function ScannerScreen({ navigation }: any) {
     }
   };
 
-  const handleProcessCode = async (code: string) => {
-    if (scanned) return;
+  const handleProcessCode = async (rawCode: string) => {
+    const code = rawCode.trim().replace(/[\r\n]/g, '');
+    if (!code) return;
+    if (scanned || isValidatingRef.current) return;
+    isValidatingRef.current = true;
     setScanned(true);
 
     let validationResult;
 
-    // 1. Pre-check local de sección (candado) tanto online como offline
-    if (allowedSections && allowedSections.length > 0) {
-      const localDb = getDb();
-      if (localDb) {
-        try {
-          const codeRow = await localDb.getFirstAsync<{ metadata: string }>(
-            'SELECT metadata FROM codes WHERE code = ?',
-            [code]
-          );
-          if (codeRow) {
-            const metadata = JSON.parse(codeRow.metadata || '{}');
-            const codeSection = metadata?.details ?? '';
-            if (!allowedSections.includes(codeSection)) {
-              await localDb.runAsync('INSERT INTO logs (code, result, scanned_at) VALUES (?, ?, ?)', [code, 'invalid_zone', new Date().toISOString()]);
-              validationResult = {
-                status: 'invalid_zone',
-                message: `Acceso denegado. Este código pertenece a la zona '${codeSection}', la cual no está habilitada para esta puerta.`,
-              };
-              setResult(validationResult);
-              Vibration.vibrate([0, 200, 100, 200]);
-              playSound('warning');
-              setLaserInput('');
-              refreshUnsyncedCount();
-              attemptAutoSync();
-              return;
-            }
+    // 1. Pre-check local de sección (candado) y estado del boleto tanto online como offline
+    const localDb = getDb();
+    if (localDb) {
+      try {
+        const codeRow = await localDb.getFirstAsync<{ status: string, type: string, metadata: string }>(
+          'SELECT status, type, metadata FROM codes WHERE code = ?',
+          [code]
+        );
+        if (codeRow) {
+          const metadata = JSON.parse(codeRow.metadata || '{}');
+          const codeSection = metadata?.details ?? '';
+
+          // A. Verificar candado de sección
+          if (allowedSections && allowedSections.length > 0 && !allowedSections.includes(codeSection)) {
+            await localDb.runAsync('INSERT INTO logs (code, result, scanned_at) VALUES (?, ?, ?)', [code, 'invalid_zone', new Date().toISOString()]);
+            validationResult = {
+              status: 'invalid_zone',
+              message: `Acceso denegado. Este código pertenece a la zona '${codeSection}', la cual no está habilitada para esta puerta.`,
+            };
+            setResult(validationResult);
+            Vibration.vibrate([0, 200, 100, 200]);
+            playSound('warning');
+            setLaserInput('');
+            refreshUnsyncedCount();
+            attemptAutoSync();
+            return;
           }
-        } catch (dbError) {
-          console.log('Error local pre-check:', dbError);
+
+          // B. Verificar si ya fue utilizado localmente (evita duplicar si está pendiente de subir)
+          if (codeRow.status === 'used') {
+            await localDb.runAsync('INSERT INTO logs (code, result, scanned_at) VALUES (?, ?, ?)', [code, 'duplicate', new Date().toISOString()]);
+            validationResult = {
+              status: 'duplicate',
+              message: 'Código ya utilizado localmente.',
+              type: codeRow.type,
+              metadata: metadata
+            };
+            setResult(validationResult);
+            Vibration.vibrate([0, 200, 100, 200]);
+            playSound('error');
+            setLaserInput('');
+            refreshUnsyncedCount();
+            attemptAutoSync();
+            return;
+          }
+
+          // C. Verificar si está cancelado localmente
+          if (codeRow.status === 'cancelled') {
+            validationResult = {
+              status: 'cancelled',
+              message: 'Código cancelado en el sistema.',
+              type: codeRow.type,
+              metadata: metadata
+            };
+            setResult(validationResult);
+            Vibration.vibrate([0, 200, 100, 200]);
+            playSound('error');
+            setLaserInput('');
+            refreshUnsyncedCount();
+            attemptAutoSync();
+            return;
+          }
         }
+      } catch (dbError) {
+        console.log('Error local pre-check:', dbError);
       }
     }
 
@@ -265,8 +335,22 @@ export default function ScannerScreen({ navigation }: any) {
     }
 
     setLaserInput('');
+    if (inputRef.current) {
+      inputRef.current.clear();
+    }
     refreshUnsyncedCount();
     attemptAutoSync();
+  };
+
+  const handleInputChange = (text: string) => {
+    if (scanned || isValidatingRef.current) {
+      setLaserInput('');
+      if (inputRef.current) {
+        inputRef.current.clear();
+      }
+    } else {
+      setLaserInput(text);
+    }
   };
 
   const handleBarCodeScanned = ({ type, data }: any) => {
@@ -274,9 +358,20 @@ export default function ScannerScreen({ navigation }: any) {
     setIsCameraActive(false); 
   };
   
-  const handleLaserSubmit = () => { if (laserInput.trim()) handleProcessCode(laserInput.trim()); };
+  const handleLaserSubmit = () => {
+    const raw = laserInput.trim();
+    if (raw) {
+      if (scanned || isValidatingRef.current) {
+        resetScanner();
+        handleProcessCode(raw);
+      } else {
+        handleProcessCode(raw);
+      }
+    }
+  };
 
   const resetScanner = () => {
+    isValidatingRef.current = false;
     setScanned(false);
     setResult(null);
     setLaserInput('');
@@ -287,6 +382,15 @@ export default function ScannerScreen({ navigation }: any) {
   };
 
   const renderResult = () => {
+    if (scanned && !result) {
+      return (
+        <View style={[StyleSheet.absoluteFillObject, styles.resultOverlay, { backgroundColor: 'rgba(0,0,0,0.85)', justifyContent: 'center', alignItems: 'center' }]}>
+          <ActivityIndicator size="large" color={colors.primary} />
+          <Text style={{ color: '#fff', marginTop: 15, fontSize: 18, fontWeight: 'bold' }}>Validando boleto...</Text>
+        </View>
+      );
+    }
+
     if (!result) return null;
 
     let bgColor = colors.danger;
@@ -353,7 +457,7 @@ export default function ScannerScreen({ navigation }: any) {
           </View>
 
           <View style={styles.resultBody}>
-              <Text style={styles.resultMessage}>{instructions}</Text>
+              <Text style={styles.resultMessage}>{result.message || instructions}</Text>
               
               {highlightTitle ? (
                 <View style={styles.actionBox}>
@@ -418,11 +522,10 @@ export default function ScannerScreen({ navigation }: any) {
             activeOpacity={1} 
             onPress={() => setIsCameraActive(true)}
         >
-            <View style={styles.instructionContainer}>
-                <Text style={styles.tapPrompt}>Toca la pantalla para activar cámara</Text>
-            </View>
-            <View style={styles.logoCenter}>
+            <View style={styles.idleWrapper}>
                 <Image source={logo} style={styles.idleLogo} resizeMode="contain" />
+                <Text style={styles.tapPrompt}>Toca la pantalla para activar cámara</Text>
+                <Text style={styles.idleVersion}>v{packageJson.version} {deviceIdentifier ? `| ID: ${deviceIdentifier}` : ''}</Text>
             </View>
         </TouchableOpacity>
       )}
@@ -469,7 +572,7 @@ export default function ScannerScreen({ navigation }: any) {
         ref={inputRef}
         style={styles.hiddenInput}
         value={laserInput}
-        onChangeText={setLaserInput}
+        onChangeText={handleInputChange}
         onSubmitEditing={handleLaserSubmit}
         autoFocus
         showSoftInputOnFocus={false}
@@ -482,11 +585,11 @@ export default function ScannerScreen({ navigation }: any) {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.background },
-  idleContainer: { flex: 1, backgroundColor: colors.background },
-  instructionContainer: { position: 'absolute', top: 120, left: 0, right: 0, alignItems: 'center' },
-  tapPrompt: { color: colors.textMuted, fontSize: 18, fontWeight: '600' },
-  logoCenter: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  idleLogo: { width: '80%', height: 200 },
+  idleContainer: { flex: 1, backgroundColor: colors.background, justifyContent: 'center', alignItems: 'center' },
+  idleWrapper: { width: '100%', alignItems: 'center', justifyContent: 'center', gap: 15 },
+  tapPrompt: { color: colors.textMuted, fontSize: 16, fontWeight: '600', textAlign: 'center' },
+  idleLogo: { width: '70%', height: 110 },
+  idleVersion: { color: colors.textMuted, fontSize: 12, marginTop: 5, fontWeight: '500' },
   backArrow: { position: 'absolute', top: 50, left: 20, zIndex: 10, padding: 10 },
   overlay: { flex: 1, justifyContent: 'space-between' },
   topBar: { flexDirection: 'row', justifyContent: 'space-between', paddingTop: 50, paddingHorizontal: 20, alignItems: 'center' },
@@ -527,24 +630,24 @@ const styles = StyleSheet.create({
     borderRadius: 5,
     backgroundColor: colors.success,
   },
-  resultOverlay: { flex: 1, padding: 15, zIndex: 1000, justifyContent: 'center' },
-  resultScrollContent: { alignItems: 'center', paddingVertical: 20 },
-  resultHeader: { alignItems: 'center', marginBottom: 15 },
-  resultTitle: { color: '#fff', fontSize: 26, fontWeight: '900', marginTop: 10, textAlign: 'center' },
-  resultBody: { alignItems: 'center', marginBottom: 20, width: '100%' },
-  resultMessage: { color: 'rgba(255,255,255,0.9)', fontSize: 16, textAlign: 'center', marginBottom: 10, fontWeight: '500' },
-  actionBox: { backgroundColor: 'rgba(0,0,0,0.4)', paddingVertical: 12, paddingHorizontal: 12, borderRadius: 12, width: '100%', alignItems: 'center', marginBottom: 12, borderWidth: 2, borderColor: 'rgba(255,255,255,0.1)' },
-  actionLabel: { color: 'rgba(255,255,255,0.7)', fontSize: 11, fontWeight: '900', letterSpacing: 1.5, marginBottom: 5 },
-  actionText: { fontSize: 22, fontWeight: '900', textAlign: 'center', textTransform: 'uppercase' },
-  duplicateBox: { backgroundColor: 'rgba(0,0,0,0.5)', padding: 12, borderRadius: 10, width: '100%', alignItems: 'center', marginBottom: 12 },
-  duplicateLabel: { color: colors.warning, fontSize: 11, fontWeight: 'bold', marginBottom: 4, letterSpacing: 1 },
-  duplicateText: { color: '#fff', fontSize: 14, fontWeight: '600', marginBottom: 2 },
-  metaBox: { backgroundColor: 'rgba(255,255,255,0.2)', padding: 12, borderRadius: 10, width: '100%', alignItems: 'center', marginBottom: 12 },
-  metaLabel: { color: 'rgba(255,255,255,0.7)', fontSize: 11, fontWeight: 'bold', marginBottom: 4 },
-  resultMeta: { color: '#fff', fontSize: 20, fontWeight: 'bold', textAlign: 'center' },
-  typeBox: { backgroundColor: 'rgba(0,0,0,0.3)', paddingHorizontal: 16, paddingVertical: 8, borderRadius: 25 },
-  resultType: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
-  resultFooter: { alignItems: 'center', width: '100%', marginTop: 10 },
+  resultOverlay: { flex: 1, padding: 10, zIndex: 1000 },
+  resultScrollContent: { flexGrow: 1, alignItems: 'center', justifyContent: 'flex-start', paddingVertical: 10 },
+  resultHeader: { alignItems: 'center', marginBottom: 10 },
+  resultTitle: { color: '#fff', fontSize: 20, fontWeight: '900', marginTop: 8, textAlign: 'center' },
+  resultBody: { alignItems: 'center', marginBottom: 10, width: '100%' },
+  resultMessage: { color: 'rgba(255,255,255,0.9)', fontSize: 14, textAlign: 'center', marginBottom: 8, fontWeight: '500' },
+  actionBox: { backgroundColor: 'rgba(0,0,0,0.4)', paddingVertical: 8, paddingHorizontal: 10, borderRadius: 10, width: '100%', alignItems: 'center', marginBottom: 8, borderWidth: 2, borderColor: 'rgba(255,255,255,0.1)' },
+  actionLabel: { color: 'rgba(255,255,255,0.7)', fontSize: 10, fontWeight: '900', letterSpacing: 1.5, marginBottom: 4 },
+  actionText: { fontSize: 16, fontWeight: '900', textAlign: 'center', textTransform: 'uppercase' },
+  duplicateBox: { backgroundColor: 'rgba(0,0,0,0.5)', padding: 8, borderRadius: 8, width: '100%', alignItems: 'center', marginBottom: 8 },
+  duplicateLabel: { color: colors.warning, fontSize: 10, fontWeight: 'bold', marginBottom: 3, letterSpacing: 1 },
+  duplicateText: { color: '#fff', fontSize: 12, fontWeight: '600', marginBottom: 1 },
+  metaBox: { backgroundColor: 'rgba(255,255,255,0.2)', padding: 8, borderRadius: 8, width: '100%', alignItems: 'center', marginBottom: 8 },
+  metaLabel: { color: 'rgba(255,255,255,0.7)', fontSize: 10, fontWeight: 'bold', marginBottom: 3 },
+  resultMeta: { color: '#fff', fontSize: 16, fontWeight: 'bold', textAlign: 'center' },
+  typeBox: { backgroundColor: 'rgba(0,0,0,0.3)', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20 },
+  resultType: { color: '#fff', fontSize: 14, fontWeight: 'bold' },
+  resultFooter: { alignItems: 'center', width: '100%', marginTop: 5 },
   btnNext: { 
     flexDirection: 'row',
     backgroundColor: 'rgba(255,255,255,0.25)', 
