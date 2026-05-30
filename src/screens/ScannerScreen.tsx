@@ -28,6 +28,11 @@ export default function ScannerScreen({ navigation }: any) {
   const [isSyncing, setIsSyncing] = useState(false);
   const [isConnected, setIsConnected] = useState<boolean | null>(true);
   const [deviceIdentifier, setDeviceIdentifier] = useState('');
+  
+  const [isForcedOffline, setIsForcedOffline] = useState(false);
+  const consecutiveNetworkFailures = useRef(0);
+  const forcedOfflineTimer = useRef<NodeJS.Timeout | null>(null);
+  const syncRetryAttempts = useRef(0);
 
   const inputRef = useRef<TextInput>(null);
   const isValidatingRef = useRef(false);
@@ -114,7 +119,20 @@ export default function ScannerScreen({ navigation }: any) {
     if (!state.isConnected || state.isInternetReachable === false) return;
 
     const logs = await getUnsyncedLogs();
-    if (logs.length === 0) return;
+    if (logs.length === 0) {
+      syncRetryAttempts.current = 0;
+      return;
+    }
+
+    // Exponential backoff
+    const baseDelay = 5000;
+    const maxDelay = 60000;
+    const currentAttempt = syncRetryAttempts.current;
+    
+    if (currentAttempt > 0) {
+      const delay = Math.min(maxDelay, baseDelay * Math.pow(2, currentAttempt - 1));
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
 
     setIsSyncing(true);
     try {
@@ -129,8 +147,10 @@ export default function ScannerScreen({ navigation }: any) {
       await markLogsAsSynced(ids);
       
       await refreshUnsyncedCount();
+      syncRetryAttempts.current = 0;
     } catch (error) {
       console.log('Error auto-sync', error);
+      syncRetryAttempts.current += 1;
     } finally {
       setIsSyncing(false);
     }
@@ -259,9 +279,10 @@ export default function ScannerScreen({ navigation }: any) {
       }
     }
 
-    if (isConnected && eventId) {
+    if (isConnected && eventId && !isForcedOffline) {
         try {
             const response = await validateCodeOnline(eventId, code, new Date().toISOString());
+            consecutiveNetworkFailures.current = 0; // Success resets counter
             
             // 2. Post-check online de sección (candado) con metadatos del servidor (por si no está en la DB local)
             if (response.status === 'success' && allowedSections && allowedSections.length > 0) {
@@ -289,6 +310,7 @@ export default function ScannerScreen({ navigation }: any) {
         } catch (error: any) {
             console.log('Online validation error:', error.message);
             if (error.response && error.response.data && error.response.data.status) {
+                consecutiveNetworkFailures.current = 0; // It was a valid server response, not a network failure
                 validationResult = error.response.data;
                 // Si el servidor responde duplicado o cancelado, también validamos sección si viene en la respuesta
                 const metadata = validationResult.metadata || {};
@@ -311,6 +333,18 @@ export default function ScannerScreen({ navigation }: any) {
                 }
             } else {
                 console.log('Connection error during online validation, falling back to local');
+                consecutiveNetworkFailures.current += 1;
+                
+                if (consecutiveNetworkFailures.current >= 3 && !isForcedOffline) {
+                    setIsForcedOffline(true);
+                    if (forcedOfflineTimer.current) {
+                        clearTimeout(forcedOfflineTimer.current);
+                    }
+                    forcedOfflineTimer.current = setTimeout(() => {
+                        setIsForcedOffline(false);
+                        consecutiveNetworkFailures.current = 0;
+                    }, 5 * 60 * 1000); // 5 minutos
+                }
                 validationResult = await validateCodeLocally(code, allowedSections);
             }
         }
@@ -448,48 +482,50 @@ export default function ScannerScreen({ navigation }: any) {
       <View style={[StyleSheet.absoluteFillObject, styles.resultOverlay, { backgroundColor: bgColor }]}>
         <ScrollView 
           style={{ flex: 1, width: '100%' }}
-          contentContainerStyle={styles.resultScrollContent}
+          contentContainerStyle={[styles.resultScrollContent, { justifyContent: 'center' }]}
           showsVerticalScrollIndicator={false}
         >
-          <View style={styles.resultHeader}>
-              <Icon color="#fff" size={80} />
-              <Text style={styles.resultTitle}>{title}</Text>
-          </View>
+          <View style={{ backgroundColor: 'rgba(0,0,0,0.4)', borderRadius: 12, padding: 20, margin: 15, alignItems: 'center', borderColor: 'rgba(255,255,255,0.2)', borderWidth: 1 }}>
+            <View style={{ alignItems: 'center', marginBottom: 10 }}>
+                <Icon color="#fff" size={60} />
+                <Text style={{ color: '#fff', fontSize: 24, fontWeight: '900', textAlign: 'center', marginTop: 10 }}>{title}</Text>
+            </View>
 
-          <View style={styles.resultBody}>
-              <Text style={styles.resultMessage}>{result.message || instructions}</Text>
-              
-              {highlightTitle ? (
-                <View style={styles.actionBox}>
-                  <Text style={styles.actionLabel}>{highlightTitle}</Text>
-                  <Text style={[styles.actionText, { color: highlightColor }]}>{highlightText}</Text>
-                </View>
-              ) : null}
-              
-              {result.duplicate_info ? (
-                <View style={styles.duplicateBox}>
-                  <Text style={styles.duplicateLabel}>ESTE BOLETO SE USÓ EN:</Text>
-                  <Text style={styles.duplicateText}>
-                    Hora: {new Date(result.duplicate_info.scanned_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                  </Text>
-                  <Text style={styles.duplicateText}>
-                    Puerta: {result.duplicate_info.device_name}
-                  </Text>
-                </View>
-              ) : null}
+            <View style={{ alignItems: 'center', width: '100%' }}>
+                <Text style={{ color: '#fff', fontSize: 18, textAlign: 'center', marginBottom: 15 }}>{result.message || instructions}</Text>
+                
+                {highlightTitle ? (
+                  <View style={{ backgroundColor: 'rgba(0,0,0,0.6)', padding: 15, borderRadius: 8, width: '100%', alignItems: 'center', marginBottom: 15 }}>
+                    <Text style={{ color: '#fff', fontSize: 14, fontWeight: 'bold', marginBottom: 5 }}>{highlightTitle}</Text>
+                    <Text style={{ color: highlightColor, fontSize: 20, fontWeight: '900', textAlign: 'center' }}>{highlightText}</Text>
+                  </View>
+                ) : null}
+                
+                {result.duplicate_info ? (
+                  <View style={{ backgroundColor: 'rgba(0,0,0,0.6)', padding: 15, borderRadius: 8, width: '100%', marginBottom: 15 }}>
+                    <Text style={{ color: '#fff', fontSize: 14, fontWeight: 'bold', marginBottom: 5, textAlign: 'center' }}>ESTE BOLETO SE USÓ EN:</Text>
+                    <Text style={{ color: '#fff', fontSize: 16, textAlign: 'center' }}>
+                      Hora: {new Date(result.duplicate_info.scanned_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    </Text>
+                    <Text style={{ color: '#fff', fontSize: 16, textAlign: 'center' }}>
+                      Puerta: {result.duplicate_info.device_name}
+                    </Text>
+                  </View>
+                ) : null}
 
-              {result.metadata && result.metadata.owner ? (
-                <View style={styles.metaBox}>
-                  <Text style={styles.metaLabel}>TITULAR DEL BOLETO</Text>
-                  <Text style={styles.resultMeta}>{result.metadata.owner}</Text>
-                </View>
-              ) : null}
+                {result.metadata && result.metadata.owner ? (
+                  <View style={{ backgroundColor: 'rgba(0,0,0,0.6)', padding: 10, borderRadius: 8, width: '100%', marginBottom: 10 }}>
+                    <Text style={{ color: '#aaa', fontSize: 12, textAlign: 'center', marginBottom: 2 }}>TITULAR DEL BOLETO</Text>
+                    <Text style={{ color: '#fff', fontSize: 18, fontWeight: 'bold', textAlign: 'center' }}>{result.metadata.owner}</Text>
+                  </View>
+                ) : null}
 
-              {result.type ? (
-                <View style={styles.typeBox}>
-                  <Text style={styles.resultType}>{result.type}</Text>
-                </View>
-              ) : null}
+                {result.type ? (
+                  <View style={{ backgroundColor: 'rgba(255,255,255,0.2)', paddingVertical: 5, paddingHorizontal: 15, borderRadius: 20, marginTop: 5 }}>
+                    <Text style={{ color: '#fff', fontSize: 14, fontWeight: 'bold' }}>{result.type}</Text>
+                  </View>
+                ) : null}
+            </View>
           </View>
         </ScrollView>
         
@@ -535,39 +571,43 @@ export default function ScannerScreen({ navigation }: any) {
       >
         <ArrowLeft color={isCameraActive ? "#fff" : colors.text} size={32} />
       </TouchableOpacity>
-      <View style={styles.overlay} pointerEvents="box-none">
-        <View style={styles.topBar}>
-          <View style={{ width: 40 }} />
-          {!isConnected ? (
-            <View style={styles.offlineBadge}>
-              <CloudOff color="#fff" size={16} />
-              <Text style={styles.offlineBadgeText}>SIN INTERNET (MODO LOCAL)</Text>
+      
+      {!result && (
+        <View style={styles.overlay} pointerEvents="box-none">
+          <View style={styles.topBar}>
+            <View style={{ width: 40 }} />
+            {!isConnected || isForcedOffline ? (
+              <View style={styles.offlineBadge}>
+                <CloudOff color="#fff" size={16} />
+                <Text style={styles.offlineBadgeText}>SIN INTERNET (MODO LOCAL)</Text>
+              </View>
+            ) : (
+              <View style={{ flex: 1 }} />
+            )}
+            <View style={{ width: 40, alignItems: 'flex-end' }}>
+              {isConnected && !isForcedOffline ? (
+                <View style={styles.onlineDot} />
+              ) : null}
             </View>
-          ) : (
-            <View style={{ flex: 1 }} />
-          )}
-          <View style={{ width: 40, alignItems: 'flex-end' }}>
-            {isConnected ? (
-              <View style={styles.onlineDot} />
-            ) : null}
           </View>
-        </View>
-        {isCameraActive ? (
-          <View style={styles.scannerFrame} pointerEvents="none">
-            <View style={styles.targetBox} />
-          </View>
-        ) : null}
-        <View style={styles.bottomBar}>
-          {unsyncedCount > 0 || isSyncing ? (
-            <View style={styles.syncBadge}>
-              <CloudUpload color={colors.warning} size={20} />
-              <Text style={styles.syncBadgeText}>
-                {isSyncing ? 'Sincronizando...' : `${unsyncedCount} pendientes`}
-              </Text>
+          {isCameraActive ? (
+            <View style={styles.scannerFrame} pointerEvents="none">
+              <View style={styles.targetBox} />
             </View>
           ) : null}
+          <View style={styles.bottomBar}>
+            {unsyncedCount > 0 || isSyncing ? (
+              <View style={styles.syncBadge}>
+                <CloudUpload color={colors.warning} size={20} />
+                <Text style={styles.syncBadgeText}>
+                  {isSyncing ? 'Sincronizando...' : `${unsyncedCount} pendientes`}
+                </Text>
+              </View>
+            ) : <View />}
+          </View>
         </View>
-      </View>
+      )}
+      
       <TextInput
         ref={inputRef}
         style={styles.hiddenInput}

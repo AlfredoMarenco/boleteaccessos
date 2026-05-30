@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getEvents } from '../services/accessService';
+import { clearDatabaseForNewEvent } from '../services/database';
 import { colors } from '../theme/colors';
 import { LogOut, Calendar } from 'lucide-react-native';
 import packageJson from '../../package.json';
@@ -43,6 +44,16 @@ export default function EventsScreen({ navigation }: any) {
   };
 
   const selectEvent = async (event: any) => {
+    const prevEventStr = await AsyncStorage.getItem('selected_event');
+    if (prevEventStr) {
+      const prevEvent = JSON.parse(prevEventStr);
+      if (prevEvent.id !== event.id) {
+        await clearDatabaseForNewEvent();
+      }
+    } else {
+      await clearDatabaseForNewEvent();
+    }
+    
     await AsyncStorage.setItem('selected_event', JSON.stringify(event));
     navigation.navigate('Sync');
   };

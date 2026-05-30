@@ -13,8 +13,10 @@ export const getEvents = async () => {
   return response.data;
 };
 
-export const syncCodes = async (eventId: number) => {
-  const response = await api.get(`/access/sync/${eventId}`);
+export const syncCodes = async (eventId: number, onProgress?: (progressEvent: any) => void) => {
+  const response = await api.get(`/access/sync/${eventId}`, {
+    onDownloadProgress: onProgress,
+  });
   return response.data;
 };
 

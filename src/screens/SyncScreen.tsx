@@ -13,6 +13,10 @@ export default function SyncScreen({ navigation }: any) {
   const [loadingUp, setLoadingUp] = useState(false);
   const [unsyncedCount, setUnsyncedCount] = useState(0);
   const [deviceIdentifier, setDeviceIdentifier] = useState('');
+  
+  const [downloadProgress, setDownloadProgress] = useState(0);
+  const [downloadSpeed, setDownloadSpeed] = useState('');
+  const [downloadedKB, setDownloadedKB] = useState('');
 
   useEffect(() => {
     loadEventData();
@@ -47,8 +51,29 @@ export default function SyncScreen({ navigation }: any) {
   const handleDownloadCodes = async () => {
     if (!event) return;
     setLoadingDown(true);
+    setDownloadProgress(0);
+    setDownloadSpeed('');
+    setDownloadedKB('');
+    
+    const startTime = Date.now();
     try {
-      const data = await syncCodes(event.id);
+      const data = await syncCodes(event.id, (progressEvent: any) => {
+        if (progressEvent.loaded) {
+          const kb = (progressEvent.loaded / 1024).toFixed(2);
+          setDownloadedKB(`${kb} KB`);
+          
+          const timeElapsed = (Date.now() - startTime) / 1000;
+          if (timeElapsed > 0) {
+            const speed = (progressEvent.loaded / 1024 / timeElapsed).toFixed(2);
+            setDownloadSpeed(`${speed} KB/s`);
+          }
+          
+          if (progressEvent.total) {
+            setDownloadProgress((progressEvent.loaded / progressEvent.total) * 100);
+          }
+        }
+      });
+      
       if (data.codes && data.codes.length > 0) {
         await insertCodesBatch(data.codes);
         // Guardar secciones permitidas para validación offline de zonas
@@ -121,6 +146,17 @@ export default function SyncScreen({ navigation }: any) {
             {loadingDown ? <ActivityIndicator color={colors.background} /> : <Text style={styles.buttonText}>Descargar</Text>}
           </TouchableOpacity>
         </View>
+        {loadingDown && (
+          <View style={{ marginTop: 15 }}>
+            <View style={{ height: 6, backgroundColor: '#e2e8f0', borderRadius: 3, overflow: 'hidden' }}>
+               <View style={{ width: `${downloadProgress || 100}%`, height: '100%', backgroundColor: colors.primary }} />
+            </View>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 5 }}>
+               <Text style={{ fontSize: 12, color: colors.textMuted }}>{downloadedKB}</Text>
+               <Text style={{ fontSize: 12, color: colors.textMuted }}>{downloadSpeed}</Text>
+            </View>
+          </View>
+        )}
       </View>
 
       <View style={styles.card}>

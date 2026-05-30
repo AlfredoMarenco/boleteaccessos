@@ -37,7 +37,7 @@ export const insertCodesBatch = async (codes: any[]) => {
   await db.withTransactionAsync(async () => {
     // Para simplificar, borramos los anteriores y metemos los nuevos
     await db?.runAsync('DELETE FROM codes');
-    await db?.runAsync('DELETE FROM logs'); // Reseteamos logs al cambiar de evento
+    // NO borramos logs aquí para preservar escaneos locales si se re-descargan los códigos del mismo evento
 
     const statement = await db?.prepareAsync(
       'INSERT INTO codes (code, type, status, metadata) VALUES ($code, $type, $status, $metadata)'
@@ -54,7 +54,18 @@ export const insertCodesBatch = async (codes: any[]) => {
         }
         await statement.finalizeAsync();
     }
+    
+    // Restaurar estado de los códigos ya escaneados localmente
+    await db?.runAsync("UPDATE codes SET status = 'used' WHERE code IN (SELECT code FROM logs WHERE result = 'success')");
   });
+};
+
+export const clearDatabaseForNewEvent = async () => {
+  if (!db) return;
+  await db.execAsync(`
+    DELETE FROM codes;
+    DELETE FROM logs;
+  `);
 };
 
 export const validateCodeLocally = async (codeStr: string, allowedSections: string[] | null = null) => {
