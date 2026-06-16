@@ -11,6 +11,8 @@ import { syncLogs, getDeltas, validateCodeOnline } from '../services/accessServi
 import { colors } from '../theme/colors';
 import { CheckCircle, XCircle, AlertTriangle, CloudOff, CloudUpload, Camera, ArrowLeft, RefreshCcw } from 'lucide-react-native';
 import packageJson from '../../package.json';
+import DataWedgeIntents from 'react-native-datawedge-intents';
+import { DeviceEventEmitter } from 'react-native';
 
 const logo = require('../assets/logoBoletea.png');
 
@@ -106,6 +108,27 @@ export default function ScannerScreen({ navigation }: any) {
       return () => subscription.remove();
     }
   }, []);
+
+  // Inicializar DataWedge
+  useEffect(() => {
+    DataWedgeIntents.registerReceiver('com.boletea.accessos.ACTION', '');
+  }, []);
+
+  // Escuchar Intents de DataWedge
+  useEffect(() => {
+    const scanSubscription = DeviceEventEmitter.addListener('datawedge_broadcast_intent', (intent) => {
+      if (intent.hasOwnProperty('com.symbol.datawedge.data_string')) {
+        const barcode = intent['com.symbol.datawedge.data_string'];
+        if (barcode && !isValidatingRef.current && !scanned) {
+          handleProcessCode(barcode);
+        }
+      }
+    });
+
+    return () => {
+      scanSubscription.remove();
+    };
+  }, [eventId, isConnected, isForcedOffline, allowedSections, scanned]); // Dependencias clave para handleProcessCode
 
   const refreshUnsyncedCount = async () => {
     const logs = await getUnsyncedLogs();
@@ -203,11 +226,29 @@ export default function ScannerScreen({ navigation }: any) {
   };
 
   const handleProcessCode = async (rawCode: string) => {
-    const code = rawCode.trim().replace(/[\r\n]/g, '');
+    // Tomamos solo el primer código para evitar concatenación de DataWedge en modo Keystroke
+    const code = rawCode.trim().split(/[\r\n]+/)[0];
     if (!code) return;
     if (scanned || isValidatingRef.current) return;
+    
     isValidatingRef.current = true;
     setScanned(true);
+
+    if (inputRef.current) {
+      inputRef.current.blur(); // Quitar el foco del input para no recibir más keystrokes
+    }
+
+    // Deshabilitar el hardware del escáner vía DataWedge API
+    try {
+      DataWedgeIntents.sendBroadcastWithExtras({
+        action: "com.symbol.datawedge.api.ACTION",
+        extras: {
+          "com.symbol.datawedge.api.SCANNER_INPUT_PLUGIN": "DISABLE_PLUGIN"
+        }
+      });
+    } catch (err) {
+      console.log("Error deshabilitando DataWedge", err);
+    }
 
     let validationResult;
 
@@ -410,6 +451,19 @@ export default function ScannerScreen({ navigation }: any) {
     setResult(null);
     setLaserInput('');
     setIsCameraActive(false); 
+    
+    // Habilitar el hardware del escáner vía DataWedge API
+    try {
+      DataWedgeIntents.sendBroadcastWithExtras({
+        action: "com.symbol.datawedge.api.ACTION",
+        extras: {
+          "com.symbol.datawedge.api.SCANNER_INPUT_PLUGIN": "ENABLE_PLUGIN"
+        }
+      });
+    } catch (err) {
+      console.log("Error habilitando DataWedge", err);
+    }
+
     setTimeout(() => {
       if (inputRef.current) inputRef.current.focus();
     }, 100);
@@ -614,6 +668,7 @@ export default function ScannerScreen({ navigation }: any) {
         value={laserInput}
         onChangeText={handleInputChange}
         onSubmitEditing={handleLaserSubmit}
+        editable={!scanned && !isValidatingRef.current}
         autoFocus
         showSoftInputOnFocus={false}
         blurOnSubmit={false}

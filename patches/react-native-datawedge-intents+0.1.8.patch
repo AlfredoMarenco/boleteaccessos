@@ -1,0 +1,42 @@
+diff --git a/node_modules/react-native-datawedge-intents/android/src/main/java/com/darryncampbell/rndatawedgeintents/RNDataWedgeIntentsModule.java b/node_modules/react-native-datawedge-intents/android/src/main/java/com/darryncampbell/rndatawedgeintents/RNDataWedgeIntentsModule.java
+--- a/node_modules/react-native-datawedge-intents/android/src/main/java/com/darryncampbell/rndatawedgeintents/RNDataWedgeIntentsModule.java
++++ b/node_modules/react-native-datawedge-intents/android/src/main/java/com/darryncampbell/rndatawedgeintents/RNDataWedgeIntentsModule.java
+@@ -105,7 +105,11 @@
+ 
+         IntentFilter filter = new IntentFilter();
+         filter.addAction(ACTION_ENUMERATEDLISET);
+-        reactContext.registerReceiver(myEnumerateScannersBroadcastReceiver, filter);
++        if (android.os.Build.VERSION.SDK_INT >= 33) {
++            reactContext.registerReceiver(myEnumerateScannersBroadcastReceiver, filter, 2);
++        } else {
++            reactContext.registerReceiver(myEnumerateScannersBroadcastReceiver, filter);
++        }
+ 	    if (this.registeredAction != null)
+           registerReceiver(this.registeredAction, this.registeredCategory);
+           
+@@ -356,7 +356,11 @@
+         filter.addAction(action);
+         if (category != null && category.length() > 0)
+           filter.addCategory(category);
+-        this.reactContext.registerReceiver(scannedDataBroadcastReceiver, filter);
++        if (android.os.Build.VERSION.SDK_INT >= 33) {
++            this.reactContext.registerReceiver(scannedDataBroadcastReceiver, filter, 2);
++        } else {
++            this.reactContext.registerReceiver(scannedDataBroadcastReceiver, filter);
++        }
+     }
+ 
+     @ReactMethod
+@@ -387,7 +387,11 @@
+                 }
+             }
+         }
+-        this.reactContext.registerReceiver(genericReceiver, filter);
++        if (android.os.Build.VERSION.SDK_INT >= 33) {
++            this.reactContext.registerReceiver(genericReceiver, filter, 2);
++        } else {
++            this.reactContext.registerReceiver(genericReceiver, filter);
++        }
+     }
+ 
+     private void unregisterReceivers() {

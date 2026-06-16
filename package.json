@@ -1,6 +1,6 @@
 {
   "name": "boleteaccessos",
-  "version": "1.0.18",
+  "version": "1.0.21",
   "main": "index.ts",
   "scripts": {
     "start": "expo start",
@@ -25,6 +25,7 @@
     "lucide-react-native": "^1.14.0",
     "react": "19.1.0",
     "react-native": "0.81.5",
+    "react-native-datawedge-intents": "^0.1.8",
     "react-native-fs": "^2.20.0",
     "react-native-safe-area-context": "~5.6.0",
     "react-native-screens": "~4.16.0",
