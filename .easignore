@@ -1,0 +1,19 @@
+# Dependencias
+node_modules/
+
+# Expo cache y builds de desarrollo
+.expo/
+dist/
+web-build/
+
+# Carpetas de compilación de Android nativo (generadas localmente)
+android/.gradle/
+android/app/build/
+android/build/
+
+# Logs y temporales
+*.log
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+.DS_Store

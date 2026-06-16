@@ -78,13 +78,78 @@ export default function ScannerScreen({ navigation }: any) {
   }, [eventId]);
 
   useEffect(() => {
+    // Focus immediately if not scanned
+    if (!scanned && inputRef.current) {
+      inputRef.current.focus();
+    }
+
+    // Set up a few short delayed focuses to ensure layout/navigation transitions are fully completed
+    const t1 = setTimeout(() => {
+      if (inputRef.current && !scanned) {
+        inputRef.current.focus();
+      }
+    }, 100);
+
+    const t2 = setTimeout(() => {
+      if (inputRef.current && !scanned) {
+        inputRef.current.focus();
+      }
+    }, 300);
+
+    const t3 = setTimeout(() => {
+      if (inputRef.current && !scanned) {
+        inputRef.current.focus();
+      }
+    }, 600);
+
     const interval = setInterval(() => {
       if (inputRef.current && !scanned) {
         inputRef.current.focus();
       }
     }, 1000);
-    return () => clearInterval(interval);
+
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+      clearTimeout(t3);
+      clearInterval(interval);
+    };
   }, [scanned]);
+
+  // React Navigation focus listener to ensure focus is regained when navigating to this screen
+  useEffect(() => {
+    const unsubscribe = navigation.addListener('focus', () => {
+      if (inputRef.current && !scanned) {
+        inputRef.current.focus();
+      }
+      
+      const t1 = setTimeout(() => {
+        if (inputRef.current && !scanned) {
+          inputRef.current.focus();
+        }
+      }, 100);
+
+      const t2 = setTimeout(() => {
+        if (inputRef.current && !scanned) {
+          inputRef.current.focus();
+        }
+      }, 300);
+
+      const t3 = setTimeout(() => {
+        if (inputRef.current && !scanned) {
+          inputRef.current.focus();
+        }
+      }, 600);
+
+      return () => {
+        clearTimeout(t1);
+        clearTimeout(t2);
+        clearTimeout(t3);
+      };
+    });
+
+    return unsubscribe;
+  }, [navigation, scanned]);
 
   useEffect(() => {
     if (Platform.OS === 'android') {

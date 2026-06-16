@@ -2,7 +2,7 @@
   "expo": {
     "name": "boleteaccessos",
     "slug": "boleteaccessos",
-    "version": "1.0.21",
+    "version": "1.0.22",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -17,7 +17,7 @@
     },
     "android": {
       "package": "com.boletea.accessos",
-      "versionCode": 21,
+      "versionCode": 22,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
@@ -33,9 +33,9 @@
     ],
     "extra": {
       "eas": {
-        "projectId": "c48cf5de-cfa0-430d-b0c0-cfebf365e4cd"
+        "projectId": "e4a599a1-0ff4-4dea-894f-dadea85a62f8"
       }
     },
-    "owner": "marencocode2"
+    "owner": "marencocode"
   }
 }
