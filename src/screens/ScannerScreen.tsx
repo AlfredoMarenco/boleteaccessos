@@ -39,6 +39,7 @@ export default function ScannerScreen({ navigation }: any) {
 
   const inputRef = useRef<TextInput>(null);
   const isValidatingRef = useRef(false);
+  const successTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     const loadEvent = async () => {
@@ -519,7 +520,10 @@ export default function ScannerScreen({ navigation }: any) {
     if (validationResult.status === 'success') {
       Vibration.vibrate(100);
       playSound('success');
-      setTimeout(() => {
+      if (successTimeoutRef.current) {
+        clearTimeout(successTimeoutRef.current);
+      }
+      successTimeoutRef.current = setTimeout(() => {
         resetScanner();
       }, 1500);
     } else if (validationResult.status === 'invalid_zone') {
@@ -539,17 +543,21 @@ export default function ScannerScreen({ navigation }: any) {
   };
 
   const handleInputChange = (text: string) => {
-    // v1.1: Evitar la entrada de texto si hay una validación activa o si se muestra la pantalla de éxito (1.5s).
-    // Esto previene que se concatenen lecturas o se escanee doble un código válido.
-    const isShowingSuccess = result && result.status === 'success';
-    if (isValidatingRef.current || isShowingSuccess) {
+    if (isValidatingRef.current) {
       setLaserInput('');
       if (inputRef.current) {
         inputRef.current.clear();
       }
-    } else {
-      setLaserInput(text);
+      return;
     }
+
+    // Si hay algún resultado previo en pantalla (éxito, error, duplicado, etc.) y se detecta texto,
+    // significa que el usuario está escaneando un nuevo boleto.
+    // Reiniciamos el estado del escáner y limpiamos la pantalla/timers inmediatamente.
+    if (result) {
+      resetScanner(true);
+    }
+    setLaserInput(text);
   };
 
   const handleBarCodeScanned = ({ type, data }: any) => {
@@ -557,13 +565,11 @@ export default function ScannerScreen({ navigation }: any) {
     setIsCameraActive(false); 
   };
   
-  const handleLaserSubmit = () => {
-    // v1.1: Prevenir el submit si hay validación activa o éxito temporal.
-    // Si hay un resultado de error/advertencia en pantalla, reiniciar escáner y validar el nuevo código.
-    const raw = laserInput.trim();
+  const handleLaserSubmit = (e: any) => {
+    // v1.3: Usar el valor directo del evento nativo para evitar el retardo asíncrono del estado de React Native
+    const raw = e.nativeEvent.text.trim();
     if (raw) {
-      const isShowingSuccess = result && result.status === 'success';
-      if (isValidatingRef.current || isShowingSuccess) {
+      if (isValidatingRef.current) {
         setLaserInput('');
         if (inputRef.current) {
           inputRef.current.clear();
@@ -571,7 +577,7 @@ export default function ScannerScreen({ navigation }: any) {
         return;
       }
 
-      // v1.2: Limpiar inmediatamente para que nuevas teclas no se concatenen mientras se procesa
+      // v1.3: Limpiar inmediatamente para que nuevas teclas no se concatenen mientras se procesa
       setLaserInput('');
       if (inputRef.current) {
         inputRef.current.clear();
@@ -586,13 +592,24 @@ export default function ScannerScreen({ navigation }: any) {
     }
   };
 
-  const resetScanner = () => {
+  const resetScanner = (keepInput = false) => {
     isValidatingRef.current = false;
     setScanned(false);
     setResult(null);
-    setLaserInput('');
+    if (!keepInput) {
+      setLaserInput('');
+      if (inputRef.current) {
+        inputRef.current.clear();
+      }
+    }
     setIsCameraActive(false); 
     
+    // Cancelar el temporizador de éxito activo para evitar colisiones
+    if (successTimeoutRef.current) {
+      clearTimeout(successTimeoutRef.current);
+      successTimeoutRef.current = null;
+    }
+
     // Habilitar el hardware del escáner vía DataWedge API
     try {
       DataWedgeIntents.sendBroadcastWithExtras({
@@ -813,6 +830,7 @@ export default function ScannerScreen({ navigation }: any) {
         autoFocus
         showSoftInputOnFocus={false}
         blurOnSubmit={false}
+        selectTextOnFocus={true}
       />
       {renderResult()}
     </View>

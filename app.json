@@ -2,7 +2,7 @@
   "expo": {
     "name": "boleteaccessos",
     "slug": "boleteaccessos",
-    "version": "1.0.25",
+    "version": "1.0.26",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -17,7 +17,7 @@
     },
     "android": {
       "package": "com.boletea.accessos",
-      "versionCode": 25,
+      "versionCode": 26,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#121314"
