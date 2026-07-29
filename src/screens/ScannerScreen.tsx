@@ -225,7 +225,7 @@ export default function ScannerScreen({ navigation }: any) {
     const scanSubscription = DeviceEventEmitter.addListener('datawedge_broadcast_intent', (intent) => {
       if (intent.hasOwnProperty('com.symbol.datawedge.data_string')) {
         const barcode = intent['com.symbol.datawedge.data_string'];
-        if (barcode && !isValidatingRef.current && !scanned) {
+        if (barcode && !isValidatingRef.current) {
           handleProcessCode(barcode);
         }
       }
@@ -234,7 +234,7 @@ export default function ScannerScreen({ navigation }: any) {
     return () => {
       scanSubscription.remove();
     };
-  }, [eventId, isConnected, isForcedOffline, allowedSections, scanned]); // Dependencias clave para handleProcessCode
+  }, [eventId, isConnected, isForcedOffline, allowedSections]); // Dependencias clave para handleProcessCode
 
   const refreshUnsyncedCount = async () => {
     const logs = await getUnsyncedLogs();
@@ -335,7 +335,12 @@ export default function ScannerScreen({ navigation }: any) {
     // Tomamos solo el primer código para evitar concatenación de DataWedge en modo Keystroke
     const code = rawCode.trim().split(/[\r\n]+/)[0];
     if (!code) return;
-    if (scanned || isValidatingRef.current) return;
+    if (isValidatingRef.current) return;
+    
+    // Si hay un resultado previo o ya se había escaneado, limpiar resultado para la nueva validación
+    if (scanned || result) {
+      setResult(null);
+    }
     
     
     // v1.2: Limpiar inmediatamente el input y estado para evitar concatenación con futuras lecturas
@@ -838,7 +843,22 @@ const styles = StyleSheet.create({
     borderColor: colors.warning,
   },
   syncBadgeText: { color: colors.warning, fontWeight: 'bold', marginLeft: 8 },
-  hiddenInput: { position: 'absolute', top: -100, left: -100, width: 1, height: 1, opacity: 0 },
+  hiddenInput: {
+    position: 'absolute',
+    bottom: 80,
+    alignSelf: 'center',
+    width: '80%',
+    height: 45,
+    backgroundColor: 'rgba(255, 255, 255, 0.95)',
+    borderColor: '#e11d48',
+    borderWidth: 2,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    color: '#000',
+    fontSize: 16,
+    fontWeight: 'bold',
+    zIndex: 9999,
+  },
   offlineBadge: {
     flexDirection: 'row',
     alignItems: 'center',
