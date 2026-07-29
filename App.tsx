@@ -12,6 +12,7 @@ import EventsScreen from './src/screens/EventsScreen';
 import SyncScreen from './src/screens/SyncScreen';
 import ScannerScreen from './src/screens/ScannerScreen';
 import UpdateChecker from './src/components/UpdateChecker';
+import ErrorBoundary from './src/components/ErrorBoundary';
 
 import { initDatabase } from './src/services/database';
 import { colors } from './src/theme/colors';
@@ -60,7 +61,7 @@ export default function App() {
   }
 
   return (
-    <>
+    <ErrorBoundary>
       <NavigationContainer>
         <StatusBar style="auto" />
         <Stack.Navigator 
@@ -98,6 +99,6 @@ export default function App() {
         </Stack.Navigator>
       </NavigationContainer>
       <UpdateChecker />
-    </>
+    </ErrorBoundary>
   );
 }

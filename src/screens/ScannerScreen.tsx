@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, TextInput, Vibration, Image, StatusBar, ScrollView, Platform, ActivityIndicator } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, TextInput, Vibration, Image, StatusBar, ScrollView, Platform, ActivityIndicator, AppState, Keyboard } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as NavigationBar from 'expo-navigation-bar';
@@ -8,6 +8,7 @@ import { Audio } from 'expo-av';
 
 import { validateCodeLocally, getUnsyncedLogs, markLogsAsSynced, updateCodesStatus, getDb } from '../services/database';
 import { syncLogs, getDeltas, validateCodeOnline } from '../services/accessService';
+import { startForegroundService, stopForegroundService } from '../services/foregroundService';
 import { colors } from '../theme/colors';
 import { CheckCircle, XCircle, AlertTriangle, CloudOff, CloudUpload, Camera, ArrowLeft, RefreshCcw } from 'lucide-react-native';
 import packageJson from '../../package.json';
@@ -78,32 +79,40 @@ export default function ScannerScreen({ navigation }: any) {
   }, [eventId]);
 
   useEffect(() => {
-    // Focus immediately if not scanned
-    if (!scanned && inputRef.current) {
+    startForegroundService('Lector de boletos activo en segundo plano.');
+    return () => {
+      stopForegroundService();
+    };
+  }, []);
+
+  useEffect(() => {
+    // v1.1: Foco constante en el TextInput, removiendo la restricción de "!scanned"
+    // para asegurar que el escáner láser por hardware siempre pueda escribir en el campo.
+    if (inputRef.current) {
       inputRef.current.focus();
     }
 
     // Set up a few short delayed focuses to ensure layout/navigation transitions are fully completed
     const t1 = setTimeout(() => {
-      if (inputRef.current && !scanned) {
+      if (inputRef.current) {
         inputRef.current.focus();
       }
     }, 100);
 
     const t2 = setTimeout(() => {
-      if (inputRef.current && !scanned) {
+      if (inputRef.current) {
         inputRef.current.focus();
       }
     }, 300);
 
     const t3 = setTimeout(() => {
-      if (inputRef.current && !scanned) {
+      if (inputRef.current) {
         inputRef.current.focus();
       }
     }, 600);
 
     const interval = setInterval(() => {
-      if (inputRef.current && !scanned) {
+      if (inputRef.current) {
         inputRef.current.focus();
       }
     }, 1000);
@@ -114,29 +123,30 @@ export default function ScannerScreen({ navigation }: any) {
       clearTimeout(t3);
       clearInterval(interval);
     };
-  }, [scanned]);
+  }, []);
 
   // React Navigation focus listener to ensure focus is regained when navigating to this screen
   useEffect(() => {
+    // v1.1: Foco constante al enfocar la pantalla a través de la navegación, removiendo restricción de "!scanned".
     const unsubscribe = navigation.addListener('focus', () => {
-      if (inputRef.current && !scanned) {
+      if (inputRef.current) {
         inputRef.current.focus();
       }
       
       const t1 = setTimeout(() => {
-        if (inputRef.current && !scanned) {
+        if (inputRef.current) {
           inputRef.current.focus();
         }
       }, 100);
 
       const t2 = setTimeout(() => {
-        if (inputRef.current && !scanned) {
+        if (inputRef.current) {
           inputRef.current.focus();
         }
       }, 300);
 
       const t3 = setTimeout(() => {
-        if (inputRef.current && !scanned) {
+        if (inputRef.current) {
           inputRef.current.focus();
         }
       }, 600);
@@ -149,7 +159,7 @@ export default function ScannerScreen({ navigation }: any) {
     });
 
     return unsubscribe;
-  }, [navigation, scanned]);
+  }, [navigation]);
 
   useEffect(() => {
     if (Platform.OS === 'android') {
@@ -172,6 +182,37 @@ export default function ScannerScreen({ navigation }: any) {
       });
       return () => subscription.remove();
     }
+  }, []);
+
+  // v1.2: Bloqueo absoluto del teclado de pantalla (Zebra)
+  useEffect(() => {
+    // 1. Ocultar teclado inmediatamente cuando se monta la pantalla
+    Keyboard.dismiss();
+
+    // 2. Escuchar cuando el teclado intenta aparecer e interrumplirlo instantáneamente
+    const keyboardShowSubscription = Keyboard.addListener('keyboardDidShow', () => {
+      Keyboard.dismiss();
+    });
+
+    // 3. Escuchar los cambios de estado de la aplicación (AppState)
+    const handleAppStateChange = (nextAppState: string) => {
+      if (nextAppState === 'active') {
+        Keyboard.dismiss();
+        setTimeout(() => {
+          Keyboard.dismiss();
+          if (inputRef.current) {
+            inputRef.current.focus();
+          }
+        }, 100);
+      }
+    };
+
+    const appStateSubscription = AppState.addEventListener('change', handleAppStateChange);
+
+    return () => {
+      keyboardShowSubscription.remove();
+      appStateSubscription.remove();
+    };
   }, []);
 
   // Inicializar DataWedge
@@ -296,12 +337,18 @@ export default function ScannerScreen({ navigation }: any) {
     if (!code) return;
     if (scanned || isValidatingRef.current) return;
     
+    
+    // v1.2: Limpiar inmediatamente el input y estado para evitar concatenación con futuras lecturas
+    setLaserInput('');
+    if (inputRef.current) {
+      inputRef.current.clear();
+    }
+
     isValidatingRef.current = true;
     setScanned(true);
 
-    if (inputRef.current) {
-      inputRef.current.blur(); // Quitar el foco del input para no recibir más keystrokes
-    }
+    // v1.1: Eliminado inputRef.current.blur() para que el input no pierda el foco nativo
+    // y el lector láser en modo Keystroke pueda seguir escribiendo de forma ininterrumpida.
 
     // Deshabilitar el hardware del escáner vía DataWedge API
     try {
@@ -342,6 +389,7 @@ export default function ScannerScreen({ navigation }: any) {
             setLaserInput('');
             refreshUnsyncedCount();
             attemptAutoSync();
+            isValidatingRef.current = false; // v1.1: Restablecer flag
             return;
           }
 
@@ -360,6 +408,7 @@ export default function ScannerScreen({ navigation }: any) {
             setLaserInput('');
             refreshUnsyncedCount();
             attemptAutoSync();
+            isValidatingRef.current = false; // v1.1: Restablecer flag
             return;
           }
 
@@ -377,6 +426,7 @@ export default function ScannerScreen({ navigation }: any) {
             setLaserInput('');
             refreshUnsyncedCount();
             attemptAutoSync();
+            isValidatingRef.current = false; // v1.1: Restablecer flag
             return;
           }
         }
@@ -459,6 +509,7 @@ export default function ScannerScreen({ navigation }: any) {
     }
 
     setResult(validationResult);
+    isValidatingRef.current = false; // v1.1: Restablecer flag al terminar validación (para permitir nuevos escaneos en overlays de error)
     
     if (validationResult.status === 'success') {
       Vibration.vibrate(100);
@@ -483,7 +534,10 @@ export default function ScannerScreen({ navigation }: any) {
   };
 
   const handleInputChange = (text: string) => {
-    if (scanned || isValidatingRef.current) {
+    // v1.1: Evitar la entrada de texto si hay una validación activa o si se muestra la pantalla de éxito (1.5s).
+    // Esto previene que se concatenen lecturas o se escanee doble un código válido.
+    const isShowingSuccess = result && result.status === 'success';
+    if (isValidatingRef.current || isShowingSuccess) {
       setLaserInput('');
       if (inputRef.current) {
         inputRef.current.clear();
@@ -499,9 +553,26 @@ export default function ScannerScreen({ navigation }: any) {
   };
   
   const handleLaserSubmit = () => {
+    // v1.1: Prevenir el submit si hay validación activa o éxito temporal.
+    // Si hay un resultado de error/advertencia en pantalla, reiniciar escáner y validar el nuevo código.
     const raw = laserInput.trim();
     if (raw) {
-      if (scanned || isValidatingRef.current) {
+      const isShowingSuccess = result && result.status === 'success';
+      if (isValidatingRef.current || isShowingSuccess) {
+        setLaserInput('');
+        if (inputRef.current) {
+          inputRef.current.clear();
+        }
+        return;
+      }
+
+      // v1.2: Limpiar inmediatamente para que nuevas teclas no se concatenen mientras se procesa
+      setLaserInput('');
+      if (inputRef.current) {
+        inputRef.current.clear();
+      }
+
+      if (scanned || result) {
         resetScanner();
         handleProcessCode(raw);
       } else {
@@ -733,7 +804,7 @@ export default function ScannerScreen({ navigation }: any) {
         value={laserInput}
         onChangeText={handleInputChange}
         onSubmitEditing={handleLaserSubmit}
-        editable={!scanned && !isValidatingRef.current}
+        editable={true} // v1.1: Mantener siempre editable para evitar des-enfoques nativos por desactivación del campo
         autoFocus
         showSoftInputOnFocus={false}
         blurOnSubmit={false}
