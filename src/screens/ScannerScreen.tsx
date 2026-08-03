@@ -743,7 +743,7 @@ export default function ScannerScreen({ navigation }: any) {
         
         {result.status !== 'success' ? (
           <View style={styles.resultFooter}>
-            <TouchableOpacity style={styles.btnNext} onPress={resetScanner}>
+            <TouchableOpacity style={styles.btnNext} onPress={() => resetScanner()}>
                 <RefreshCcw color="#fff" size={24} />
                 <Text style={styles.btnNextText}>CONTINUAR ESCANEANDO</Text>
             </TouchableOpacity>
@@ -863,19 +863,10 @@ const styles = StyleSheet.create({
   syncBadgeText: { color: colors.warning, fontWeight: 'bold', marginLeft: 8 },
   hiddenInput: {
     position: 'absolute',
-    bottom: 80,
-    alignSelf: 'center',
-    width: '80%',
-    height: 45,
-    backgroundColor: 'rgba(255, 255, 255, 0.95)',
-    borderColor: '#e11d48',
-    borderWidth: 2,
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    color: '#000',
-    fontSize: 16,
-    fontWeight: 'bold',
-    zIndex: 9999,
+    width: 1,
+    height: 1,
+    opacity: 0,
+    left: -9999,
   },
   offlineBadge: {
     flexDirection: 'row',
