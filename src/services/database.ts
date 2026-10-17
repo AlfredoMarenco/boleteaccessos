@@ -12,9 +12,23 @@ export const initDatabase = async () => {
       code TEXT NOT NULL UNIQUE,
       type TEXT,
       status TEXT NOT NULL,
-      metadata TEXT
+      metadata TEXT,
+      max_uses INTEGER DEFAULT 1,
+      scans_count INTEGER DEFAULT 0
     );
   `);
+
+  // Migraciones seguras para bases de datos ya existentes
+  try {
+    await db.execAsync(`ALTER TABLE codes ADD COLUMN max_uses INTEGER DEFAULT 1;`);
+  } catch (e) {
+    // Columna ya existe
+  }
+  try {
+    await db.execAsync(`ALTER TABLE codes ADD COLUMN scans_count INTEGER DEFAULT 0;`);
+  } catch (e) {
+    // Columna ya existe
+  }
 
   // Tabla para registrar cada escaneo localmente antes de sincronizar
   await db.execAsync(`
@@ -40,7 +54,7 @@ export const insertCodesBatch = async (codes: any[]) => {
     // NO borramos logs aquí para preservar escaneos locales si se re-descargan los códigos del mismo evento
 
     const statement = await db?.prepareAsync(
-      'INSERT INTO codes (code, type, status, metadata) VALUES ($code, $type, $status, $metadata)'
+      'INSERT INTO codes (code, type, status, metadata, max_uses, scans_count) VALUES ($code, $type, $status, $metadata, $max_uses, $scans_count)'
     );
 
     if (statement) {
@@ -50,13 +64,24 @@ export const insertCodesBatch = async (codes: any[]) => {
             $type: c.type || 'General',
             $status: c.status,
             $metadata: JSON.stringify(c.metadata || {}),
+            $max_uses: c.max_uses ?? 1,
+            $scans_count: c.scans_count ?? 0,
         });
         }
         await statement.finalizeAsync();
     }
     
-    // Restaurar estado de los códigos ya escaneados localmente
-    await db?.runAsync("UPDATE codes SET status = 'used' WHERE code IN (SELECT code FROM logs WHERE result = 'success')");
+    // Restaurar escaneos locales y estado de los códigos ya escaneados localmente
+    await db?.runAsync(`
+      UPDATE codes 
+      SET scans_count = (SELECT COUNT(*) FROM logs WHERE logs.code = codes.code AND logs.result = 'success')
+      WHERE code IN (SELECT code FROM logs WHERE result = 'success')
+    `);
+    await db?.runAsync(`
+      UPDATE codes 
+      SET status = 'used' 
+      WHERE scans_count >= max_uses
+    `);
   });
 };
 
@@ -71,8 +96,8 @@ export const clearDatabaseForNewEvent = async () => {
 export const validateCodeLocally = async (codeStr: string, allowedSections: string[] | null = null) => {
   if (!db) return { status: 'error', message: 'DB not initialized' };
 
-  const codeRow = await db.getFirstAsync<{ id: number, code: string, type: string, status: string, metadata: string }>(
-    'SELECT * FROM codes WHERE code = ?',
+  const codeRow = await db.getFirstAsync<{ id: number, code: string, type: string, status: string, metadata: string, max_uses: number, scans_count: number }>(
+    'SELECT id, code, type, status, metadata, max_uses, scans_count FROM codes WHERE code = ?',
     [codeStr]
   );
 
@@ -83,13 +108,26 @@ export const validateCodeLocally = async (codeStr: string, allowedSections: stri
     return { status: 'invalid', message: 'Código no encontrado en el evento.' };
   }
 
-  if (codeRow.status === 'used') {
+  const maxUses = codeRow.max_uses ?? 1;
+  const currentScans = codeRow.scans_count ?? 0;
+
+  if (currentScans >= maxUses || codeRow.status === 'used') {
     await db.runAsync('INSERT INTO logs (code, result, scanned_at) VALUES (?, ?, ?)', [codeStr, 'duplicate', scannedAt]);
-    return { status: 'duplicate', message: 'Código ya utilizado.' };
+    const duplicateMsg = maxUses > 1
+      ? `Límite de accesos alcanzado (${currentScans} de ${maxUses}).`
+      : 'Código ya utilizado.';
+    return {
+      status: 'duplicate',
+      message: duplicateMsg,
+      scans_count: currentScans,
+      max_uses: maxUses,
+      type: codeRow.type,
+      metadata: JSON.parse(codeRow.metadata || '{}')
+    };
   }
 
   if (codeRow.status === 'cancelled') {
-    return { status: 'cancelled', message: 'Código cancelado.' };
+    return { status: 'cancelled', message: 'Código cancelado.', type: codeRow.type, metadata: JSON.parse(codeRow.metadata || '{}') };
   }
 
   // Validación offline de zona (si el dispositivo tiene secciones restringidas)
@@ -105,11 +143,28 @@ export const validateCodeLocally = async (codeStr: string, allowedSections: stri
     }
   }
 
-  // Éxito: Marcar como usado y registrar
-  await db.runAsync('UPDATE codes SET status = ? WHERE id = ?', ['used', codeRow.id]);
+  // Éxito: Incrementar contador y marcar como 'used' si llegó al límite
+  const newScans = currentScans + 1;
+  const isUsed = newScans >= maxUses;
+  const newStatus = isUsed ? 'used' : 'pending';
+
+  await db.runAsync('UPDATE codes SET scans_count = ?, status = ? WHERE id = ?', [newScans, newStatus, codeRow.id]);
   await db.runAsync('INSERT INTO logs (code, result, scanned_at) VALUES (?, ?, ?)', [codeStr, 'success', scannedAt]);
 
-  return { status: 'success', message: 'Acceso concedido.', type: codeRow.type, metadata: JSON.parse(codeRow.metadata || '{}') };
+  const remaining = Math.max(0, maxUses - newScans);
+  const successMsg = maxUses > 1
+    ? `Acceso ${newScans} de ${maxUses} concedido.`
+    : 'Acceso concedido.';
+
+  return {
+    status: 'success',
+    message: successMsg,
+    type: codeRow.type,
+    metadata: JSON.parse(codeRow.metadata || '{}'),
+    scans_count: newScans,
+    max_uses: maxUses,
+    remaining_scans: remaining,
+  };
 };
 
 export const getUnsyncedLogs = async () => {
@@ -123,11 +178,18 @@ export const markLogsAsSynced = async (ids: number[]) => {
   await db.runAsync(`UPDATE logs SET synced = 1 WHERE id IN (${placeholders})`, ids);
 };
 
-export const updateCodesStatus = async (deltas: { code: string; status: string }[]) => {
+export const updateCodesStatus = async (deltas: { code: string; status: string; max_uses?: number; scans_count?: number }[]) => {
   if (!db || deltas.length === 0) return;
   try {
     for (const d of deltas) {
-      await db.runAsync('UPDATE codes SET status = ? WHERE code = ?', [d.status, d.code]);
+      if (d.scans_count !== undefined) {
+        await db.runAsync(
+          'UPDATE codes SET status = ?, scans_count = ?, max_uses = COALESCE(?, max_uses) WHERE code = ?',
+          [d.status, d.scans_count, d.max_uses ?? null, d.code]
+        );
+      } else {
+        await db.runAsync('UPDATE codes SET status = ? WHERE code = ?', [d.status, d.code]);
+      }
     }
   } catch (error) {
     console.log("Error en updateCodesStatus:", error);

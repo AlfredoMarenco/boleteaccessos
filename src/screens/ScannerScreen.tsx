@@ -374,13 +374,15 @@ export default function ScannerScreen({ navigation }: any) {
     const localDb = getDb();
     if (localDb) {
       try {
-        const codeRow = await localDb.getFirstAsync<{ status: string, type: string, metadata: string }>(
-          'SELECT status, type, metadata FROM codes WHERE code = ?',
+        const codeRow = await localDb.getFirstAsync<{ status: string, type: string, metadata: string, max_uses: number, scans_count: number }>(
+          'SELECT status, type, metadata, max_uses, scans_count FROM codes WHERE code = ?',
           [code]
         );
         if (codeRow) {
           const metadata = JSON.parse(codeRow.metadata || '{}');
           const codeSection = metadata?.details ?? '';
+          const maxUses = codeRow.max_uses ?? 1;
+          const currentScans = codeRow.scans_count ?? 0;
 
           // A. Verificar candado de sección
           if (allowedSections && allowedSections.length > 0 && !allowedSections.includes(codeSection)) {
@@ -399,12 +401,17 @@ export default function ScannerScreen({ navigation }: any) {
             return;
           }
 
-          // B. Verificar si ya fue utilizado localmente (evita duplicar si está pendiente de subir)
-          if (codeRow.status === 'used') {
+          // B. Verificar si ya agotó sus accesos localmente (evita duplicar si está pendiente de subir)
+          if (currentScans >= maxUses || codeRow.status === 'used') {
             await localDb.runAsync('INSERT INTO logs (code, result, scanned_at) VALUES (?, ?, ?)', [code, 'duplicate', new Date().toISOString()]);
+            const duplicateMsg = maxUses > 1
+              ? `Límite de accesos alcanzado localmente (${currentScans} de ${maxUses}).`
+              : 'Código ya utilizado localmente.';
             validationResult = {
               status: 'duplicate',
-              message: 'Código ya utilizado localmente.',
+              message: duplicateMsg,
+              scans_count: currentScans,
+              max_uses: maxUses,
               type: codeRow.type,
               metadata: metadata
             };
@@ -461,12 +468,24 @@ export default function ScannerScreen({ navigation }: any) {
                 }
               } else {
                 validationResult = response;
-                await updateCodesStatus([{ code, status: 'used' }]);
+                const isFinal = response.remaining_scans === 0;
+                await updateCodesStatus([{
+                  code,
+                  status: isFinal ? 'used' : 'pending',
+                  scans_count: response.scans_count,
+                  max_uses: response.max_uses,
+                }]);
               }
             } else {
               validationResult = response;
               if (validationResult.status === 'success') {
-                await updateCodesStatus([{ code, status: 'used' }]);
+                const isFinal = response.remaining_scans === 0;
+                await updateCodesStatus([{
+                  code,
+                  status: isFinal ? 'used' : 'pending',
+                  scans_count: response.scans_count,
+                  max_uses: response.max_uses,
+                }]);
               }
             }
         } catch (error: any) {
@@ -488,7 +507,12 @@ export default function ScannerScreen({ navigation }: any) {
                   }
                 } else {
                   if (validationResult.status === 'duplicate') {
-                      await updateCodesStatus([{ code, status: 'used' }]);
+                      await updateCodesStatus([{
+                        code,
+                        status: 'used',
+                        scans_count: validationResult.scans_count,
+                        max_uses: validationResult.max_uses,
+                      }]);
                   } else if (validationResult.status === 'cancelled') {
                       await updateCodesStatus([{ code, status: 'cancelled' }]);
                   }
@@ -650,16 +674,33 @@ export default function ScannerScreen({ navigation }: any) {
     if (result.status === 'success') {
       bgColor = colors.success;
       Icon = CheckCircle;
-      title = 'ACCESO PERMITIDO';
-      instructions = 'Validación correcta en sistema.';
+      const maxUses = result.max_uses || 1;
+      const scansCount = result.scans_count || 1;
+
+      if (maxUses > 1) {
+        title = `ACCESO ${scansCount} DE ${maxUses}`;
+        const remaining = result.remaining_scans !== undefined ? result.remaining_scans : Math.max(0, maxUses - scansCount);
+        instructions = remaining === 0 
+          ? '¡ÚLTIMO ACCESO DISPONIBLE CONSUMIDO!' 
+          : `Boleto multi-acceso: Quedan ${remaining} acceso(s) disponible(s).`;
+      } else {
+        title = 'ACCESO PERMITIDO';
+        instructions = 'Validación correcta en sistema.';
+      }
       highlightTitle = 'ACCIÓN REQUERIDA:';
       highlightText = 'PERMITIR INGRESO';
       highlightColor = '#a7f3d0'; // Light green
     } else if (result.status === 'duplicate') {
       bgColor = colors.warning;
       Icon = AlertTriangle;
-      title = 'BOLETO YA USADO';
-      instructions = 'Este código ya tiene un registro de entrada.';
+      const maxUses = result.max_uses || 1;
+      if (maxUses > 1) {
+        title = 'LÍMITE ALCANZADO';
+        instructions = `Este código ya consumió sus ${maxUses} accesos permitidos.`;
+      } else {
+        title = 'BOLETO YA USADO';
+        instructions = 'Este código ya tiene un registro de entrada.';
+      }
       highlightTitle = 'ACCIÓN REQUERIDA:';
       highlightText = 'DENEGAR ACCESO';
       highlightColor = '#fecaca'; // Light red
@@ -706,6 +747,14 @@ export default function ScannerScreen({ navigation }: any) {
             <View style={{ alignItems: 'center', width: '100%' }}>
                 <Text style={{ color: '#fff', fontSize: 18, textAlign: 'center', marginBottom: 15 }}>{result.message || instructions}</Text>
                 
+                {result.max_uses && result.max_uses > 1 ? (
+                  <View style={{ backgroundColor: 'rgba(255,255,255,0.25)', paddingVertical: 8, paddingHorizontal: 16, borderRadius: 12, marginBottom: 15, borderWidth: 1, borderColor: 'rgba(255,255,255,0.4)', width: '100%', alignItems: 'center' }}>
+                    <Text style={{ color: '#fff', fontSize: 16, fontWeight: '900', textAlign: 'center' }}>
+                      PASE MULTI-ACCESO ({result.scans_count || 1} / {result.max_uses})
+                    </Text>
+                  </View>
+                ) : null}
+
                 {highlightTitle ? (
                   <View style={{ backgroundColor: 'rgba(0,0,0,0.6)', padding: 15, borderRadius: 8, width: '100%', alignItems: 'center', marginBottom: 15 }}>
                     <Text style={{ color: '#fff', fontSize: 14, fontWeight: 'bold', marginBottom: 5 }}>{highlightTitle}</Text>
