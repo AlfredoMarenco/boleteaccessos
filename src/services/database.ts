@@ -96,9 +96,18 @@ export const clearDatabaseForNewEvent = async () => {
 export const validateCodeLocally = async (codeStr: string, allowedSections: string[] | null = null) => {
   if (!db) return { status: 'error', message: 'DB not initialized' };
 
+  // Soporte para QR Dinamico BLT1.{code}.{window}.{sig} cuando opera 100% offline
+  let normalizedCode = codeStr.trim();
+  if (normalizedCode.startsWith('BLT1.')) {
+    const parts = normalizedCode.split('.');
+    if (parts.length >= 2 && parts[1]) {
+      normalizedCode = parts[1];
+    }
+  }
+
   const codeRow = await db.getFirstAsync<{ id: number, code: string, type: string, status: string, metadata: string, max_uses: number, scans_count: number }>(
     'SELECT id, code, type, status, metadata, max_uses, scans_count FROM codes WHERE code = ?',
-    [codeStr]
+    [normalizedCode]
   );
 
   const scannedAt = new Date().toISOString();
