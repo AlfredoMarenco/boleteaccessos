@@ -78,6 +78,10 @@ export default function SyncScreen({ navigation }: any) {
         await insertCodesBatch(data.codes);
         // Guardar secciones permitidas para validación offline de zonas
         await AsyncStorage.setItem('allowed_sections', JSON.stringify(data.allowed_sections ?? null));
+        // Guardar feature flags para control de salida, código externo y reubicación asistida
+        if (data.features) {
+          await AsyncStorage.setItem('event_features', JSON.stringify(data.features));
+        }
         Alert.alert('Éxito', `Se descargaron ${data.codes.length} boletos para escanear offline.`);
         checkUnsyncedLogs();
       } else {
@@ -106,6 +110,8 @@ export default function SyncScreen({ navigation }: any) {
       const formattedLogs = logs.map((l) => ({
         code: l.code,
         scanned_at: l.scanned_at,
+        direction: l.direction || 'in',
+        override_reason: l.override_reason || null,
       }));
 
       const data = await syncLogs(event.id, formattedLogs);
@@ -183,93 +189,96 @@ export default function SyncScreen({ navigation }: any) {
 
 const styles = StyleSheet.create({
   container: {
-    flexGrow: 1,
-    backgroundColor: colors.background,
     padding: 20,
+    flexGrow: 1,
+    justifyContent: 'center',
   },
   header: {
     marginBottom: 30,
-    marginTop: 20,
+    alignItems: 'center',
   },
   subtitle: {
     fontSize: 14,
     color: colors.textMuted,
-  },
-  deviceSubtitle: {
-    fontSize: 14,
-    color: colors.textMuted,
-    marginTop: 4,
-    fontWeight: '500',
+    textTransform: 'uppercase',
+    letterSpacing: 1,
   },
   title: {
-    fontSize: 26,
+    fontSize: 22,
     fontWeight: 'bold',
-    color: colors.primary,
+    color: colors.text,
+    textAlign: 'center',
+    marginTop: 5,
+  },
+  deviceSubtitle: {
+    fontSize: 12,
+    color: colors.textMuted,
+    marginTop: 6,
+    fontWeight: '600',
   },
   card: {
     backgroundColor: colors.card,
-    borderRadius: 12,
     padding: 20,
+    borderRadius: 12,
     marginBottom: 20,
-    borderWidth: 1,
-    borderColor: colors.border,
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
   },
   actionRow: {
-    flexDirection: 'column',
+    flexDirection: 'row',
     alignItems: 'center',
-    gap: 16,
+    justifyContent: 'space-between',
   },
   actionInfo: {
-    alignItems: 'center',
+    flex: 1,
+    paddingRight: 10,
   },
   actionTitle: {
-    fontSize: 18,
+    fontSize: 16,
     fontWeight: 'bold',
     color: colors.text,
     marginTop: 8,
   },
   actionDesc: {
-    fontSize: 14,
+    fontSize: 12,
     color: colors.textMuted,
-    textAlign: 'center',
     marginTop: 4,
   },
   button: {
     backgroundColor: colors.primary,
-    paddingHorizontal: 24,
-    paddingVertical: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
     borderRadius: 8,
-    width: '100%',
+    minWidth: 100,
     alignItems: 'center',
   },
   buttonText: {
-    color: colors.background,
+    color: '#fff',
     fontWeight: 'bold',
-    fontSize: 16,
+    fontSize: 14,
   },
   scanButton: {
-    backgroundColor: '#000',
+    backgroundColor: colors.text,
     flexDirection: 'row',
-    padding: 20,
-    borderRadius: 12,
-    alignItems: 'center',
     justifyContent: 'center',
-    marginTop: 'auto',
-    marginBottom: 20,
+    alignItems: 'center',
+    padding: 18,
+    borderRadius: 12,
+    marginTop: 10,
   },
   scanButtonText: {
     color: colors.background,
-    fontWeight: '900',
-    fontSize: 18,
-    marginLeft: 12,
-    letterSpacing: 1,
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginLeft: 10,
   },
   versionText: {
+    textAlign: 'center',
     color: colors.textMuted,
     fontSize: 12,
-    textAlign: 'center',
-    marginTop: 10,
-    marginBottom: 20,
-    fontWeight: '500',
+    marginTop: 20,
   },
 });
