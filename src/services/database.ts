@@ -241,7 +241,10 @@ export const validateCodeLocally = async (
 
     // Validar zona permitida a menos que haya override
     const codeSection = metadata?.details ?? '';
-    const hasZoneOverride = overrideReason === 'wheelchair' || overrideReason === 'wheelchair_assisted_access';
+    const hasZoneOverride =
+      overrideReason === 'wheelchair' ||
+      overrideReason === 'wheelchair_assisted_access' ||
+      Boolean(metadata?.assisted_zone_authorized);
     if (!hasZoneOverride && allowedSections && allowedSections.length > 0 && codeSection && !allowedSections.includes(codeSection)) {
       await database.runAsync(
         'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
@@ -316,7 +319,10 @@ export const validateCodeLocally = async (
   }
 
   // Validación offline de zona (si el dispositivo tiene secciones restringidas)
-  const isAssistedWheelchair = overrideReason === 'wheelchair' || overrideReason === 'wheelchair_assisted_access';
+  const isAssistedWheelchair =
+    overrideReason === 'wheelchair' ||
+    overrideReason === 'wheelchair_assisted_access' ||
+    Boolean(metadata?.assisted_zone_authorized);
   if (!isAssistedWheelchair && allowedSections && allowedSections.length > 0) {
     const codeSection = metadata?.details ?? '';
     if (codeSection && !allowedSections.includes(codeSection)) {
@@ -340,9 +346,13 @@ export const validateCodeLocally = async (
   const isUsed = newScans >= maxUses;
   const newStatus = isUsed ? 'used' : 'pending';
 
+  if (isAssistedWheelchair) {
+    metadata.assisted_zone_authorized = true;
+  }
+
   await database.runAsync(
-    'UPDATE codes SET scans_count = ?, inside_count = ?, status = ? WHERE id = ?',
-    [newScans, newInside, newStatus, codeRow.id]
+    'UPDATE codes SET scans_count = ?, inside_count = ?, status = ?, metadata = ? WHERE id = ?',
+    [newScans, newInside, newStatus, JSON.stringify(metadata), codeRow.id]
   );
   await database.runAsync(
     'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
@@ -456,13 +466,19 @@ export const updateCodesStatus = async (
     max_uses?: number;
     scans_count?: number;
     inside_count?: number;
+    metadata?: any;
   }[]
 ) => {
   const database = await getOrOpenDb();
   if (!database || deltas.length === 0) return;
   try {
     for (const d of deltas) {
-      if (d.scans_count !== undefined && d.inside_count !== undefined) {
+      if (d.metadata !== undefined && d.scans_count !== undefined && d.inside_count !== undefined) {
+        await database.runAsync(
+          'UPDATE codes SET status = ?, scans_count = ?, inside_count = ?, max_uses = COALESCE(?, max_uses), metadata = ? WHERE code = ?',
+          [d.status, d.scans_count, d.inside_count, d.max_uses ?? null, JSON.stringify(d.metadata), d.code]
+        );
+      } else if (d.scans_count !== undefined && d.inside_count !== undefined) {
         await database.runAsync(
           'UPDATE codes SET status = ?, scans_count = ?, inside_count = ?, max_uses = COALESCE(?, max_uses) WHERE code = ?',
           [d.status, d.scans_count, d.inside_count, d.max_uses ?? null, d.code]

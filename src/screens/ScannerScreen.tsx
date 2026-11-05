@@ -586,8 +586,10 @@ export default function ScannerScreen({ navigation }: any) {
             return;
           }
 
-          // Verificar candado de sección (si no hay override)
+          // Verificar candado de sección (si no hay override ni autorización asistida previa)
+          const isAlreadyAssisted = Boolean(metadata?.assisted_zone_authorized);
           if (
+            !isAlreadyAssisted &&
             allowedSections &&
             allowedSections.length > 0 &&
             codeSection &&
@@ -693,7 +695,8 @@ export default function ScannerScreen({ navigation }: any) {
         ) {
           const metadata = response.metadata || {};
           const codeSection = metadata.details ?? '';
-          if (codeSection && !allowedSections.includes(codeSection)) {
+          const isAlreadyAssisted = Boolean(metadata?.assisted_zone_authorized);
+          if (!isAlreadyAssisted && codeSection && !allowedSections.includes(codeSection)) {
             validationResult = {
               status: 'invalid_zone',
               direction: currentDirection,
@@ -717,6 +720,7 @@ export default function ScannerScreen({ navigation }: any) {
                 scans_count: response.scans_count,
                 inside_count: response.inside_count,
                 max_uses: response.max_uses,
+                metadata: response.metadata,
               },
             ]);
           }
@@ -724,6 +728,9 @@ export default function ScannerScreen({ navigation }: any) {
           validationResult = response;
           if (validationResult.status === 'success') {
             const isFinal = response.remaining_scans === 0;
+            const updatedMetadata = allowOverride
+              ? { ...(response.metadata || {}), assisted_zone_authorized: true }
+              : response.metadata;
             await updateCodesStatus([
               {
                 code: targetCode,
@@ -731,6 +738,7 @@ export default function ScannerScreen({ navigation }: any) {
                 scans_count: response.scans_count,
                 inside_count: response.inside_count,
                 max_uses: response.max_uses,
+                metadata: updatedMetadata,
               },
             ]);
           }
@@ -744,8 +752,10 @@ export default function ScannerScreen({ navigation }: any) {
 
           const metadata = validationResult.metadata || {};
           const codeSection = metadata.details ?? '';
+          const isAlreadyAssisted = Boolean(metadata?.assisted_zone_authorized);
           if (
             !allowOverride &&
+            !isAlreadyAssisted &&
             allowedSections &&
             allowedSections.length > 0 &&
             codeSection &&
@@ -934,11 +944,21 @@ export default function ScannerScreen({ navigation }: any) {
     }, 100);
   };
 
-  // Reubicación asistida para silla de ruedas
+  // Reubicación asistida para silla de ruedas (respeta modo ENTRADA o SALIDA)
   const handleWheelchairOverride = () => {
     if (!lastScannedCode) return;
+    const targetDirection: 'in' | 'out' =
+      result?.direction === 'out' ? 'out' : scanMode;
+    const targetScanMethod: 'barcode' | 'nfc' | 'camera' =
+      result?.scan_method || 'barcode';
     resetScanner();
-    handleProcessCode(lastScannedCode, 'in', true, 'wheelchair_assisted_access');
+    handleProcessCode(
+      lastScannedCode,
+      targetDirection,
+      true,
+      'wheelchair_assisted_access',
+      targetScanMethod
+    );
   };
 
   // Guardar código externo al vuelo
