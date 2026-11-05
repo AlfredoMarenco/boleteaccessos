@@ -53,17 +53,19 @@ export default function EventsScreen({ navigation }: any) {
     } else {
       await clearDatabaseForNewEvent();
     }
-    
+
     await AsyncStorage.setItem('selected_event', JSON.stringify(event));
     if (
       event.allow_exit_reentry !== undefined ||
       event.allow_external_code_registration !== undefined ||
-      event.allow_assisted_zone_override !== undefined
+      event.allow_assisted_zone_override !== undefined ||
+      event.allow_nfc_access !== undefined
     ) {
       const features = {
         allow_exit_reentry: Boolean(event.allow_exit_reentry),
         allow_external_code_registration: Boolean(event.allow_external_code_registration),
         allow_assisted_zone_override: Boolean(event.allow_assisted_zone_override),
+        allow_nfc_access: Boolean(event.allow_nfc_access),
       };
       await AsyncStorage.setItem('event_features', JSON.stringify(features));
     }

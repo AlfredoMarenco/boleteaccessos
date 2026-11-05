@@ -37,6 +37,14 @@ import {
   registerExternalCode,
 } from '../services/accessService';
 import { startForegroundService, stopForegroundService } from '../services/foregroundService';
+import {
+  startNfcReader,
+  stopNfcReader,
+  openNfcSettings,
+  subscribeNfcTagScanned,
+  subscribeNfcStatusChanged,
+  NfcStatus,
+} from '../services/nfcService';
 import { colors } from '../theme/colors';
 import {
   CheckCircle,
@@ -50,6 +58,7 @@ import {
   LogIn,
   UserPlus,
   Accessibility,
+  Nfc,
   X,
 } from 'lucide-react-native';
 import packageJson from '../../package.json';
@@ -62,6 +71,7 @@ interface EventFeatures {
   allow_exit_reentry?: boolean;
   allow_external_code_registration?: boolean;
   allow_assisted_zone_override?: boolean;
+  allow_nfc_access?: boolean;
 }
 
 export default function ScannerScreen({ navigation }: any) {
@@ -82,7 +92,10 @@ export default function ScannerScreen({ navigation }: any) {
     allow_exit_reentry: false,
     allow_external_code_registration: false,
     allow_assisted_zone_override: false,
+    allow_nfc_access: false,
   });
+  const [nfcStatus, setNfcStatus] = useState<NfcStatus>('unsupported');
+  const lastNfcScanRef = useRef<{ key: string; time: number }>({ key: '', time: 0 });
   const [unsyncedCount, setUnsyncedCount] = useState(0);
   const [isSyncing, setIsSyncing] = useState(false);
   const [isConnected, setIsConnected] = useState<boolean | null>(true);
@@ -303,6 +316,77 @@ export default function ScannerScreen({ navigation }: any) {
     };
   }, [eventId, isConnected, isForcedOffline, allowedSections, scanMode, isExternalModalVisible]);
 
+  // Inicializar y escuchar antena NFC (Zebra / Android) cuando el evento lo habilita
+  useEffect(() => {
+    if (!eventFeatures?.allow_nfc_access) {
+      stopNfcReader();
+      setNfcStatus('unsupported');
+      return;
+    }
+
+    let isMounted = true;
+    startNfcReader().then((status) => {
+      if (isMounted) {
+        setNfcStatus(status);
+      }
+    });
+
+    const statusSub = subscribeNfcStatusChanged((status) => {
+      if (isMounted) {
+        setNfcStatus(status);
+      }
+    });
+
+    const tagSub = subscribeNfcTagScanned((nfcEvent) => {
+      const now = Date.now();
+      const dedupKey = nfcEvent.uid || nfcEvent.code;
+      if (
+        lastNfcScanRef.current.key === dedupKey &&
+        now - lastNfcScanRef.current.time < 2500
+      ) {
+        return;
+      }
+      lastNfcScanRef.current = { key: dedupKey, time: now };
+
+      if (isExternalModalVisible) {
+        setExtCodeInput(nfcEvent.code);
+        Vibration.vibrate(60);
+        return;
+      }
+
+      if (!isValidatingRef.current) {
+        if (scanned || result) {
+          resetScanner();
+        }
+        handleProcessCode(
+          nfcEvent.code,
+          scanMode,
+          false,
+          null,
+          'nfc',
+          nfcEvent.candidates
+        );
+      }
+    });
+
+    return () => {
+      isMounted = false;
+      statusSub.remove();
+      tagSub.remove();
+      stopNfcReader();
+    };
+  }, [
+    eventFeatures?.allow_nfc_access,
+    eventId,
+    isConnected,
+    isForcedOffline,
+    allowedSections,
+    scanMode,
+    isExternalModalVisible,
+    scanned,
+    result,
+  ]);
+
   const refreshUnsyncedCount = async () => {
     const logs = await getUnsyncedLogs();
     setUnsyncedCount(logs.length);
@@ -400,9 +484,11 @@ export default function ScannerScreen({ navigation }: any) {
     rawCode: string,
     currentDirection: 'in' | 'out' = scanMode,
     allowOverride: boolean = false,
-    overrideReason: string | null = null
+    overrideReason: string | null = null,
+    scanMethod: 'barcode' | 'nfc' | 'camera' = 'barcode',
+    nfcCandidates: string[] = []
   ) => {
-    const code = rawCode.trim().split(/[\r\n]+/)[0];
+    let code = rawCode.trim().split(/[\r\n]+/)[0];
     if (!code) return;
     if (isValidatingRef.current) return;
 
@@ -437,7 +523,8 @@ export default function ScannerScreen({ navigation }: any) {
     const localDb = getDb();
     if (localDb && !allowOverride) {
       try {
-        const codeRow = await localDb.getFirstAsync<{
+        let codeRow = await localDb.getFirstAsync<{
+          code: string;
           status: string;
           type: string;
           metadata: string;
@@ -445,9 +532,29 @@ export default function ScannerScreen({ navigation }: any) {
           scans_count: number;
           inside_count: number;
         }>(
-          'SELECT status, type, metadata, max_uses, scans_count, inside_count FROM codes WHERE code = ?',
+          'SELECT code, status, type, metadata, max_uses, scans_count, inside_count FROM codes WHERE code = ?',
           [code]
         );
+
+        if (!codeRow && scanMethod === 'nfc' && nfcCandidates.length > 0) {
+          const placeholders = nfcCandidates.map(() => '?').join(',');
+          codeRow = await localDb.getFirstAsync<{
+            code: string;
+            status: string;
+            type: string;
+            metadata: string;
+            max_uses: number;
+            scans_count: number;
+            inside_count: number;
+          }>(
+            `SELECT code, status, type, metadata, max_uses, scans_count, inside_count FROM codes WHERE code IN (${placeholders}) LIMIT 1`,
+            nfcCandidates
+          );
+          if (codeRow?.code) {
+            code = codeRow.code;
+            setLastScannedCode(code);
+          }
+        }
 
         if (codeRow) {
           const metadata = JSON.parse(codeRow.metadata || '{}');
@@ -567,9 +674,15 @@ export default function ScannerScreen({ navigation }: any) {
           new Date().toISOString(),
           currentDirection,
           allowOverride,
-          overrideReason
+          overrideReason,
+          scanMethod,
+          nfcCandidates
         );
         consecutiveNetworkFailures.current = 0;
+        const targetCode = response.matched_code || code;
+        if (response.matched_code) {
+          setLastScannedCode(response.matched_code);
+        }
 
         // Post-check online de sección si no hubo override
         if (
@@ -591,7 +704,7 @@ export default function ScannerScreen({ navigation }: any) {
             if (ldb) {
               await ldb.runAsync(
                 'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-                [code, 'invalid_zone', new Date().toISOString(), currentDirection, overrideReason]
+                [targetCode, 'invalid_zone', new Date().toISOString(), currentDirection, overrideReason]
               );
             }
           } else {
@@ -599,7 +712,7 @@ export default function ScannerScreen({ navigation }: any) {
             const isFinal = response.remaining_scans === 0;
             await updateCodesStatus([
               {
-                code,
+                code: targetCode,
                 status: isFinal ? 'used' : 'pending',
                 scans_count: response.scans_count,
                 inside_count: response.inside_count,
@@ -613,7 +726,7 @@ export default function ScannerScreen({ navigation }: any) {
             const isFinal = response.remaining_scans === 0;
             await updateCodesStatus([
               {
-                code,
+                code: targetCode,
                 status: isFinal ? 'used' : 'pending',
                 scans_count: response.scans_count,
                 inside_count: response.inside_count,
@@ -627,6 +740,7 @@ export default function ScannerScreen({ navigation }: any) {
         if (error.response && error.response.data && error.response.data.status) {
           consecutiveNetworkFailures.current = 0;
           validationResult = error.response.data;
+          const errTargetCode = validationResult.matched_code || code;
 
           const metadata = validationResult.metadata || {};
           const codeSection = metadata.details ?? '';
@@ -647,14 +761,14 @@ export default function ScannerScreen({ navigation }: any) {
             if (ldb) {
               await ldb.runAsync(
                 'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-                [code, 'invalid_zone', new Date().toISOString(), currentDirection, overrideReason]
+                [errTargetCode, 'invalid_zone', new Date().toISOString(), currentDirection, overrideReason]
               );
             }
           } else {
             if (validationResult.status === 'duplicate') {
               await updateCodesStatus([
                 {
-                  code,
+                  code: errTargetCode,
                   status: 'used',
                   scans_count: validationResult.scans_count,
                   inside_count: validationResult.inside_count,
@@ -662,7 +776,7 @@ export default function ScannerScreen({ navigation }: any) {
                 },
               ]);
             } else if (validationResult.status === 'cancelled') {
-              await updateCodesStatus([{ code, status: 'cancelled' }]);
+              await updateCodesStatus([{ code: errTargetCode, status: 'cancelled' }]);
             }
           }
         } else {
@@ -683,8 +797,12 @@ export default function ScannerScreen({ navigation }: any) {
             code,
             allowOverride ? null : allowedSections,
             currentDirection,
-            overrideReason
+            overrideReason,
+            scanMethod === 'nfc' ? nfcCandidates : []
           );
+          if (validationResult?.matched_code) {
+            setLastScannedCode(validationResult.matched_code);
+          }
         }
       }
     } else {
@@ -692,8 +810,16 @@ export default function ScannerScreen({ navigation }: any) {
         code,
         allowOverride ? null : allowedSections,
         currentDirection,
-        overrideReason
+        overrideReason,
+        scanMethod === 'nfc' ? nfcCandidates : []
       );
+      if (validationResult?.matched_code) {
+        setLastScannedCode(validationResult.matched_code);
+      }
+    }
+
+    if (validationResult) {
+      validationResult.scan_method = scanMethod;
     }
 
     setResult(validationResult);
@@ -746,7 +872,7 @@ export default function ScannerScreen({ navigation }: any) {
   };
 
   const handleBarCodeScanned = ({ type, data }: any) => {
-    handleProcessCode(data, scanMode);
+    handleProcessCode(data, scanMode, false, null, 'camera');
     setIsCameraActive(false);
   };
 
@@ -1167,19 +1293,38 @@ export default function ScannerScreen({ navigation }: any) {
                 </View>
               ) : null}
 
-              {result.type ? (
-                <View
-                  style={{
-                    backgroundColor: 'rgba(255,255,255,0.2)',
-                    paddingVertical: 5,
-                    paddingHorizontal: 15,
-                    borderRadius: 20,
-                    marginTop: 5,
-                  }}
-                >
-                  <Text style={{ color: '#fff', fontSize: 14, fontWeight: 'bold' }}>{result.type}</Text>
-                </View>
-              ) : null}
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, justifyContent: 'center', marginTop: 5 }}>
+                {result.type ? (
+                  <View
+                    style={{
+                      backgroundColor: 'rgba(255,255,255,0.2)',
+                      paddingVertical: 5,
+                      paddingHorizontal: 15,
+                      borderRadius: 20,
+                    }}
+                  >
+                    <Text style={{ color: '#fff', fontSize: 14, fontWeight: 'bold' }}>{result.type}</Text>
+                  </View>
+                ) : null}
+                {result.scan_method === 'nfc' ? (
+                  <View
+                    style={{
+                      backgroundColor: 'rgba(16,185,129,0.35)',
+                      paddingVertical: 5,
+                      paddingHorizontal: 12,
+                      borderRadius: 20,
+                      borderWidth: 1,
+                      borderColor: 'rgba(255,255,255,0.45)',
+                      flexDirection: 'row',
+                      alignItems: 'center',
+                      gap: 5,
+                    }}
+                  >
+                    <Nfc color="#fff" size={14} />
+                    <Text style={{ color: '#fff', fontSize: 12, fontWeight: '900' }}>NFC</Text>
+                  </View>
+                ) : null}
+              </View>
             </View>
           </View>
         </ScrollView>
@@ -1219,6 +1364,14 @@ export default function ScannerScreen({ navigation }: any) {
           <View style={styles.idleWrapper}>
             <Image source={logo} style={styles.idleLogo} resizeMode="contain" />
             <Text style={styles.tapPrompt}>Toca la pantalla para activar cámara</Text>
+            {eventFeatures?.allow_nfc_access && nfcStatus === 'enabled' ? (
+              <View style={styles.idleNfcHint}>
+                <Nfc color="#10b981" size={16} />
+                <Text style={styles.idleNfcHintText}>
+                  Acerca pulsera/tarjeta NFC o dispara el láser
+                </Text>
+              </View>
+            ) : null}
             <Text style={styles.idleVersion}>
               v{packageJson.version} {deviceIdentifier ? `| ID: ${deviceIdentifier}` : ''}
             </Text>
@@ -1288,19 +1441,47 @@ export default function ScannerScreen({ navigation }: any) {
 
       {!result && (
         <View style={styles.overlay} pointerEvents="box-none">
-          <View style={styles.topBar}>
-            <View style={{ width: 40 }} />
-            {!isConnected || isForcedOffline ? (
-              <View style={styles.offlineBadge}>
-                <CloudOff color="#fff" size={16} />
-                <Text style={styles.offlineBadgeText}>SIN INTERNET (MODO LOCAL)</Text>
+          <View pointerEvents="box-none">
+            <View style={styles.topBar} pointerEvents="box-none">
+              <View style={{ width: 40 }} />
+              {!isConnected || isForcedOffline ? (
+                <View style={styles.offlineBadge}>
+                  <CloudOff color="#fff" size={16} />
+                  <Text style={styles.offlineBadgeText}>SIN INTERNET (MODO LOCAL)</Text>
+                </View>
+              ) : (
+                <View style={{ flex: 1 }} />
+              )}
+              <View style={{ width: 40, alignItems: 'flex-end' }}>
+                {isConnected && !isForcedOffline ? <View style={styles.onlineDot} /> : null}
               </View>
-            ) : (
-              <View style={{ flex: 1 }} />
-            )}
-            <View style={{ width: 40, alignItems: 'flex-end' }}>
-              {isConnected && !isForcedOffline ? <View style={styles.onlineDot} /> : null}
             </View>
+
+            {eventFeatures?.allow_nfc_access && nfcStatus !== 'unsupported' ? (
+              <View
+                style={[
+                  styles.nfcStatusRow,
+                  eventFeatures?.allow_exit_reentry ? { marginTop: 36 } : { marginTop: 8 },
+                ]}
+                pointerEvents="box-none"
+              >
+                {nfcStatus === 'enabled' ? (
+                  <View style={styles.nfcBadgeEnabled}>
+                    <Nfc color="#10b981" size={15} />
+                    <Text style={styles.nfcBadgeEnabledText}>NFC ACTIVO</Text>
+                  </View>
+                ) : (
+                  <TouchableOpacity
+                    style={styles.nfcBadgeDisabled}
+                    onPress={openNfcSettings}
+                    activeOpacity={0.85}
+                  >
+                    <Nfc color="#fff" size={15} />
+                    <Text style={styles.nfcBadgeDisabledText}>NFC APAGADO · Toca para activar</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+            ) : null}
           </View>
           {isCameraActive ? (
             <View style={styles.scannerFrame} pointerEvents="none">
@@ -1363,7 +1544,9 @@ export default function ScannerScreen({ navigation }: any) {
             </View>
 
             <Text style={styles.modalSubtitle}>
-              Escanea o ingresa el boleto de otro sistema para autorizar su ingreso al recinto.
+              {eventFeatures?.allow_nfc_access
+                ? 'Escanea con láser, acerca la pulsera/tarjeta NFC o ingresa el código para autorizar su ingreso.'
+                : 'Escanea o ingresa el boleto de otro sistema para autorizar su ingreso al recinto.'}
             </Text>
 
             <Text style={styles.label}>Código de Boleto / Barra:</Text>
@@ -1445,6 +1628,60 @@ const styles = StyleSheet.create({
   },
   idleWrapper: { width: '100%', alignItems: 'center', justifyContent: 'center', gap: 15 },
   tapPrompt: { color: colors.textMuted, fontSize: 16, fontWeight: '600', textAlign: 'center' },
+  idleNfcHint: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: 'rgba(16, 185, 129, 0.12)',
+    paddingVertical: 6,
+    paddingHorizontal: 14,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(16, 185, 129, 0.35)',
+  },
+  idleNfcHintText: {
+    color: '#059669',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  nfcStatusRow: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 25,
+  },
+  nfcBadgeEnabled: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: 'rgba(15, 23, 42, 0.88)',
+    paddingVertical: 5,
+    paddingHorizontal: 12,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: '#10b981',
+  },
+  nfcBadgeEnabledText: {
+    color: '#10b981',
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.6,
+  },
+  nfcBadgeDisabled: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: '#d97706',
+    paddingVertical: 6,
+    paddingHorizontal: 14,
+    borderRadius: 20,
+    elevation: 4,
+  },
+  nfcBadgeDisabledText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 0.3,
+  },
   idleLogo: { width: '70%', height: 110 },
   idleVersion: { color: colors.textMuted, fontSize: 12, marginTop: 5, fontWeight: '500' },
   backArrow: { position: 'absolute', top: 50, left: 20, zIndex: 10, padding: 10 },

@@ -49,7 +49,9 @@ export const validateCodeOnline = async (
   scannedAt: string,
   direction: 'in' | 'out' = 'in',
   allowZoneOverride: boolean = false,
-  overrideReason: string | null = null
+  overrideReason: string | null = null,
+  scanMethod: 'barcode' | 'nfc' | 'camera' = 'barcode',
+  nfcCandidates: string[] = []
 ) => {
   const response = await api.post('/access/validate', {
     event_id: eventId,
@@ -58,6 +60,8 @@ export const validateCodeOnline = async (
     direction,
     allow_zone_override: allowZoneOverride,
     override_reason: overrideReason,
+    scan_method: scanMethod,
+    nfc_candidates: scanMethod === 'nfc' ? nfcCandidates : undefined,
   });
   return response.data;
 };

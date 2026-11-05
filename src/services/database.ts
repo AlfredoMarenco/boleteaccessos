@@ -153,7 +153,8 @@ export const validateCodeLocally = async (
   codeStr: string,
   allowedSections: string[] | null = null,
   direction: 'in' | 'out' = 'in',
-  overrideReason: string | null = null
+  overrideReason: string | null = null,
+  nfcCandidates: string[] = []
 ) => {
   const database = await getOrOpenDb();
   if (!database) return { status: 'error', message: 'DB not initialized' };
@@ -167,7 +168,7 @@ export const validateCodeLocally = async (
     }
   }
 
-  const codeRow = await database.getFirstAsync<{
+  let codeRow = await database.getFirstAsync<{
     id: number;
     code: string;
     type: string;
@@ -182,6 +183,24 @@ export const validateCodeLocally = async (
     [normalizedCode]
   );
 
+  if (!codeRow && nfcCandidates && nfcCandidates.length > 0) {
+    const placeholders = nfcCandidates.map(() => '?').join(',');
+    codeRow = await database.getFirstAsync<{
+      id: number;
+      code: string;
+      type: string;
+      status: string;
+      metadata: string;
+      max_uses: number;
+      scans_count: number;
+      inside_count: number;
+      is_external: number;
+    }>(
+      `SELECT id, code, type, status, metadata, max_uses, scans_count, inside_count, is_external FROM codes WHERE code IN (${placeholders}) LIMIT 1`,
+      nfcCandidates
+    );
+  }
+
   const scannedAt = new Date().toISOString();
 
   if (!codeRow) {
@@ -191,6 +210,8 @@ export const validateCodeLocally = async (
     );
     return { status: 'invalid', message: 'Código no encontrado en el evento.' };
   }
+
+  const effectiveCode = codeRow.code || codeStr;
 
   const maxUses = codeRow.max_uses ?? 1;
   const currentScans = codeRow.scans_count ?? 0;
@@ -204,10 +225,11 @@ export const validateCodeLocally = async (
     if (currentInside <= 0) {
       await database.runAsync(
         'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-        [codeStr, 'cannot_exit_not_inside', scannedAt, 'out', overrideReason]
+        [effectiveCode, 'cannot_exit_not_inside', scannedAt, 'out', overrideReason]
       );
       return {
         status: 'cannot_exit_not_inside',
+        matched_code: effectiveCode,
         message: 'No se puede dar salida: este boleto no ha registrado entrada previa.',
         scans_count: currentScans,
         inside_count: currentInside,
@@ -223,10 +245,11 @@ export const validateCodeLocally = async (
     if (!hasZoneOverride && allowedSections && allowedSections.length > 0 && codeSection && !allowedSections.includes(codeSection)) {
       await database.runAsync(
         'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-        [codeStr, 'invalid_zone', scannedAt, 'out', overrideReason]
+        [effectiveCode, 'invalid_zone', scannedAt, 'out', overrideReason]
       );
       return {
         status: 'invalid_zone',
+        matched_code: effectiveCode,
         message: `Salida denegada. Este código pertenece a la zona '${codeSection}', la cual no está habilitada para esta puerta.`,
         type: codeRow.type,
         metadata,
@@ -245,7 +268,7 @@ export const validateCodeLocally = async (
 
     await database.runAsync(
       'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-      [codeStr, 'success', scannedAt, 'out', overrideReason]
+      [effectiveCode, 'success', scannedAt, 'out', overrideReason]
     );
 
     const remaining = Math.max(0, maxUses - newScans);
@@ -253,6 +276,7 @@ export const validateCodeLocally = async (
     return {
       status: 'success',
       direction: 'out',
+      matched_code: effectiveCode,
       message: 'Salida registrada. Puede reingresar.',
       type: codeRow.type,
       metadata,
@@ -270,13 +294,14 @@ export const validateCodeLocally = async (
   if (currentScans >= maxUses || codeRow.status === 'used') {
     await database.runAsync(
       'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-      [codeStr, 'duplicate', scannedAt, 'in', overrideReason]
+      [effectiveCode, 'duplicate', scannedAt, 'in', overrideReason]
     );
     const duplicateMsg = maxUses > 1
       ? `Límite de accesos alcanzado (${currentScans} de ${maxUses}).`
       : 'Código ya utilizado.';
     return {
       status: 'duplicate',
+      matched_code: effectiveCode,
       message: duplicateMsg,
       scans_count: currentScans,
       inside_count: currentInside,
@@ -287,7 +312,7 @@ export const validateCodeLocally = async (
   }
 
   if (codeRow.status === 'cancelled') {
-    return { status: 'cancelled', message: 'Código cancelado.', type: codeRow.type, metadata };
+    return { status: 'cancelled', matched_code: effectiveCode, message: 'Código cancelado.', type: codeRow.type, metadata };
   }
 
   // Validación offline de zona (si el dispositivo tiene secciones restringidas)
@@ -297,10 +322,11 @@ export const validateCodeLocally = async (
     if (codeSection && !allowedSections.includes(codeSection)) {
       await database.runAsync(
         'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-        [codeStr, 'invalid_zone', scannedAt, 'in', overrideReason]
+        [effectiveCode, 'invalid_zone', scannedAt, 'in', overrideReason]
       );
       return {
         status: 'invalid_zone',
+        matched_code: effectiveCode,
         message: `Acceso denegado. Este código pertenece a la zona '${codeSection}', la cual no está habilitada para esta puerta.`,
         type: codeRow.type,
         metadata,
@@ -320,7 +346,7 @@ export const validateCodeLocally = async (
   );
   await database.runAsync(
     'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-    [codeStr, 'success', scannedAt, 'in', overrideReason]
+    [effectiveCode, 'success', scannedAt, 'in', overrideReason]
   );
 
   const remaining = Math.max(0, maxUses - newScans);
@@ -333,6 +359,7 @@ export const validateCodeLocally = async (
   return {
     status: 'success',
     direction: 'in',
+    matched_code: effectiveCode,
     message: successMsg,
     type: codeRow.type,
     metadata,

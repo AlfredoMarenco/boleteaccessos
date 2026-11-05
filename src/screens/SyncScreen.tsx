@@ -76,17 +76,16 @@ export default function SyncScreen({ navigation }: any) {
         }
       });
       
+      await AsyncStorage.setItem('allowed_sections', JSON.stringify(data.allowed_sections ?? null));
+      if (data.features) {
+        await AsyncStorage.setItem('event_features', JSON.stringify(data.features));
+      }
+
       if (data.codes && data.codes.length > 0) {
         setSavingStatus(`Guardando ${data.codes.length} boletos localmente...`);
         await insertCodesBatch(data.codes, (processed, total) => {
           setSavingStatus(`Guardando boletos: ${processed} de ${total}...`);
         });
-        // Guardar secciones permitidas para validación offline de zonas
-        await AsyncStorage.setItem('allowed_sections', JSON.stringify(data.allowed_sections ?? null));
-        // Guardar feature flags para control de salida, código externo y reubicación asistida
-        if (data.features) {
-          await AsyncStorage.setItem('event_features', JSON.stringify(data.features));
-        }
         setSavingStatus('');
         Alert.alert('Éxito', `Se descargaron y guardaron ${data.codes.length} boletos para escanear offline.`);
         checkUnsyncedLogs();
