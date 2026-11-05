@@ -2,7 +2,7 @@
   "expo": {
     "name": "boleteaccessos",
     "slug": "boleteaccessos",
-    "version": "1.0.30",
+    "version": "1.0.31",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -17,7 +17,7 @@
     },
     "android": {
       "package": "com.boletea.accessos",
-      "versionCode": 30,
+      "versionCode": 31,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#121314"
@@ -39,4 +39,5 @@
     "owner": "marencocode"
   }
 }
+
 
