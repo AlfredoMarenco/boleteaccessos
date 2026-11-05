@@ -17,6 +17,7 @@ export default function SyncScreen({ navigation }: any) {
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloadSpeed, setDownloadSpeed] = useState('');
   const [downloadedKB, setDownloadedKB] = useState('');
+  const [savingStatus, setSavingStatus] = useState('');
 
   useEffect(() => {
     loadEventData();
@@ -54,6 +55,7 @@ export default function SyncScreen({ navigation }: any) {
     setDownloadProgress(0);
     setDownloadSpeed('');
     setDownloadedKB('');
+    setSavingStatus('');
     
     const startTime = Date.now();
     try {
@@ -75,14 +77,18 @@ export default function SyncScreen({ navigation }: any) {
       });
       
       if (data.codes && data.codes.length > 0) {
-        await insertCodesBatch(data.codes);
+        setSavingStatus(`Guardando ${data.codes.length} boletos localmente...`);
+        await insertCodesBatch(data.codes, (processed, total) => {
+          setSavingStatus(`Guardando boletos: ${processed} de ${total}...`);
+        });
         // Guardar secciones permitidas para validación offline de zonas
         await AsyncStorage.setItem('allowed_sections', JSON.stringify(data.allowed_sections ?? null));
         // Guardar feature flags para control de salida, código externo y reubicación asistida
         if (data.features) {
           await AsyncStorage.setItem('event_features', JSON.stringify(data.features));
         }
-        Alert.alert('Éxito', `Se descargaron ${data.codes.length} boletos para escanear offline.`);
+        setSavingStatus('');
+        Alert.alert('Éxito', `Se descargaron y guardaron ${data.codes.length} boletos para escanear offline.`);
         checkUnsyncedLogs();
       } else {
         Alert.alert('Aviso', 'El evento no tiene boletos registrados.');
@@ -161,6 +167,11 @@ export default function SyncScreen({ navigation }: any) {
                <Text style={{ fontSize: 12, color: colors.textMuted }}>{downloadedKB}</Text>
                <Text style={{ fontSize: 12, color: colors.textMuted }}>{downloadSpeed}</Text>
             </View>
+            {savingStatus ? (
+              <Text style={{ fontSize: 12, color: colors.primary, marginTop: 4, fontWeight: '600', textAlign: 'center' }}>
+                {savingStatus}
+              </Text>
+            ) : null}
           </View>
         )}
       </View>

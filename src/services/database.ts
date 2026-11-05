@@ -1,12 +1,25 @@
 import * as SQLite from 'expo-sqlite';
 
 let db: SQLite.SQLiteDatabase | null = null;
+let dbInitPromise: Promise<SQLite.SQLiteDatabase> | null = null;
+
+export const getOrOpenDb = async (): Promise<SQLite.SQLiteDatabase> => {
+  if (db) return db;
+  if (!dbInitPromise) {
+    dbInitPromise = (async () => {
+      const opened = await SQLite.openDatabaseAsync('boletea.db');
+      db = opened;
+      return opened;
+    })();
+  }
+  return await dbInitPromise;
+};
 
 export const initDatabase = async () => {
-  db = await SQLite.openDatabaseAsync('boletea.db');
+  const database = await getOrOpenDb();
 
   // Tabla para almacenar los códigos del evento actual
-  await db.execAsync(`
+  await database.execAsync(`
     CREATE TABLE IF NOT EXISTS codes (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       code TEXT NOT NULL UNIQUE,
@@ -22,28 +35,28 @@ export const initDatabase = async () => {
 
   // Migraciones seguras para bases de datos ya existentes
   try {
-    await db.execAsync(`ALTER TABLE codes ADD COLUMN max_uses INTEGER DEFAULT 1;`);
+    await database.execAsync(`ALTER TABLE codes ADD COLUMN max_uses INTEGER DEFAULT 1;`);
   } catch (e) {
     // Columna ya existe
   }
   try {
-    await db.execAsync(`ALTER TABLE codes ADD COLUMN scans_count INTEGER DEFAULT 0;`);
+    await database.execAsync(`ALTER TABLE codes ADD COLUMN scans_count INTEGER DEFAULT 0;`);
   } catch (e) {
     // Columna ya existe
   }
   try {
-    await db.execAsync(`ALTER TABLE codes ADD COLUMN inside_count INTEGER DEFAULT 0;`);
+    await database.execAsync(`ALTER TABLE codes ADD COLUMN inside_count INTEGER DEFAULT 0;`);
   } catch (e) {
     // Columna ya existe
   }
   try {
-    await db.execAsync(`ALTER TABLE codes ADD COLUMN is_external INTEGER DEFAULT 0;`);
+    await database.execAsync(`ALTER TABLE codes ADD COLUMN is_external INTEGER DEFAULT 0;`);
   } catch (e) {
     // Columna ya existe
   }
 
   // Tabla para registrar cada escaneo localmente antes de sincronizar
-  await db.execAsync(`
+  await database.execAsync(`
     CREATE TABLE IF NOT EXISTS logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       code TEXT NOT NULL,
@@ -56,12 +69,12 @@ export const initDatabase = async () => {
   `);
 
   try {
-    await db.execAsync(`ALTER TABLE logs ADD COLUMN direction TEXT DEFAULT 'in';`);
+    await database.execAsync(`ALTER TABLE logs ADD COLUMN direction TEXT DEFAULT 'in';`);
   } catch (e) {
     // Columna ya existe
   }
   try {
-    await db.execAsync(`ALTER TABLE logs ADD COLUMN override_reason TEXT;`);
+    await database.execAsync(`ALTER TABLE logs ADD COLUMN override_reason TEXT;`);
   } catch (e) {
     // Columna ya existe
   }
@@ -70,54 +83,70 @@ export const initDatabase = async () => {
 export const getDb = () => db;
 
 // Funciones Helper para manejo rápido
-export const insertCodesBatch = async (codes: any[]) => {
-  if (!db) return;
-  // Use transactions for fast bulk inserts
-  await db.withTransactionAsync(async () => {
-    // Para simplificar, borramos los anteriores y metemos los nuevos
-    await db?.runAsync('DELETE FROM codes');
-    // NO borramos logs aquí para preservar escaneos locales si se re-descargan los códigos del mismo evento
+export const insertCodesBatch = async (
+  codes: any[],
+  onProgress?: (processed: number, total: number) => void
+) => {
+  const database = await getOrOpenDb();
+  if (!database) return;
 
-    const statement = await db?.prepareAsync(
-      'INSERT INTO codes (code, type, status, metadata, max_uses, scans_count, inside_count, is_external) VALUES ($code, $type, $status, $metadata, $max_uses, $scans_count, $inside_count, $is_external)'
-    );
+  // 1. Borrar códigos del evento previo de manera segura
+  await database.runAsync('DELETE FROM codes');
 
-    if (statement) {
-      for (const c of codes) {
-        await statement.executeAsync({
-          $code: c.code,
-          $type: c.type || 'General',
-          $status: c.status,
-          $metadata: JSON.stringify(c.metadata || {}),
-          $max_uses: c.max_uses ?? 1,
-          $scans_count: c.scans_count ?? 0,
-          $inside_count: c.inside_count ?? 0,
-          $is_external: c.is_external ? 1 : 0,
-        });
+  // 2. Insertar en lotes (chunks) para no colapsar la memoria nativa ni causar timeout con miles de boletos
+  const CHUNK_SIZE = 500;
+  let processed = 0;
+
+  for (let i = 0; i < codes.length; i += CHUNK_SIZE) {
+    const chunk = codes.slice(i, i + CHUNK_SIZE);
+
+    await database.withTransactionAsync(async () => {
+      const statement = await database.prepareAsync(
+        'INSERT INTO codes (code, type, status, metadata, max_uses, scans_count, inside_count, is_external) VALUES ($code, $type, $status, $metadata, $max_uses, $scans_count, $inside_count, $is_external)'
+      );
+
+      try {
+        for (const c of chunk) {
+          await statement.executeAsync({
+            $code: c.code,
+            $type: c.type || 'General',
+            $status: c.status,
+            $metadata: JSON.stringify(c.metadata || {}),
+            $max_uses: c.max_uses ?? 1,
+            $scans_count: c.scans_count ?? 0,
+            $inside_count: c.inside_count ?? 0,
+            $is_external: c.is_external ? 1 : 0,
+          });
+        }
+      } finally {
+        await statement.finalizeAsync();
       }
-      await statement.finalizeAsync();
+    });
+
+    processed += chunk.length;
+    if (onProgress) {
+      onProgress(processed, codes.length);
     }
-    
-    // Restaurar escaneos locales y estado de los códigos ya escaneados localmente
-    await db?.runAsync(`
-      UPDATE codes 
-      SET scans_count = (SELECT COUNT(*) FROM logs WHERE logs.code = codes.code AND logs.result = 'success' AND (logs.direction IS NULL OR logs.direction = 'in'))
-      WHERE code IN (SELECT code FROM logs WHERE result = 'success')
-    `);
-    await db?.runAsync(`
-      UPDATE codes 
-      SET status = 'used' 
-      WHERE scans_count >= max_uses
-    `);
-  });
+  }
+
+  // 3. Restaurar escaneos locales y estado de los códigos ya escaneados localmente
+  await database.runAsync(`
+    UPDATE codes 
+    SET scans_count = (SELECT COUNT(*) FROM logs WHERE logs.code = codes.code AND logs.result = 'success' AND (logs.direction IS NULL OR logs.direction = 'in'))
+    WHERE code IN (SELECT code FROM logs WHERE result = 'success')
+  `);
+  await database.runAsync(`
+    UPDATE codes 
+    SET status = 'used' 
+    WHERE scans_count >= max_uses
+  `);
 };
 
 export const clearDatabaseForNewEvent = async () => {
-  if (!db) return;
-  await db.execAsync(`
-    DELETE FROM codes;
-    DELETE FROM logs;
-  `);
+  const database = await getOrOpenDb();
+  if (!database) return;
+  await database.runAsync('DELETE FROM codes');
+  await database.runAsync('DELETE FROM logs');
 };
 
 export const validateCodeLocally = async (
@@ -126,7 +155,8 @@ export const validateCodeLocally = async (
   direction: 'in' | 'out' = 'in',
   overrideReason: string | null = null
 ) => {
-  if (!db) return { status: 'error', message: 'DB not initialized' };
+  const database = await getOrOpenDb();
+  if (!database) return { status: 'error', message: 'DB not initialized' };
 
   // Soporte para QR Dinamico BLT1.{code}.{window}.{sig} cuando opera 100% offline
   let normalizedCode = codeStr.trim();
@@ -137,7 +167,7 @@ export const validateCodeLocally = async (
     }
   }
 
-  const codeRow = await db.getFirstAsync<{
+  const codeRow = await database.getFirstAsync<{
     id: number;
     code: string;
     type: string;
@@ -155,7 +185,7 @@ export const validateCodeLocally = async (
   const scannedAt = new Date().toISOString();
 
   if (!codeRow) {
-    await db.runAsync(
+    await database.runAsync(
       'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
       [codeStr, 'invalid', scannedAt, direction, overrideReason]
     );
@@ -172,7 +202,7 @@ export const validateCodeLocally = async (
   // ----------------------------------------------------
   if (direction === 'out') {
     if (currentInside <= 0) {
-      await db.runAsync(
+      await database.runAsync(
         'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
         [codeStr, 'cannot_exit_not_inside', scannedAt, 'out', overrideReason]
       );
@@ -191,7 +221,7 @@ export const validateCodeLocally = async (
     const codeSection = metadata?.details ?? '';
     const hasZoneOverride = overrideReason === 'wheelchair' || overrideReason === 'wheelchair_assisted_access';
     if (!hasZoneOverride && allowedSections && allowedSections.length > 0 && codeSection && !allowedSections.includes(codeSection)) {
-      await db.runAsync(
+      await database.runAsync(
         'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
         [codeStr, 'invalid_zone', scannedAt, 'out', overrideReason]
       );
@@ -208,12 +238,12 @@ export const validateCodeLocally = async (
     // Si estaba used, se reactiva a pending para permitir reingreso
     const newStatus = 'pending';
 
-    await db.runAsync(
+    await database.runAsync(
       'UPDATE codes SET inside_count = ?, scans_count = ?, status = ? WHERE id = ?',
       [newInside, newScans, newStatus, codeRow.id]
     );
 
-    await db.runAsync(
+    await database.runAsync(
       'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
       [codeStr, 'success', scannedAt, 'out', overrideReason]
     );
@@ -238,7 +268,7 @@ export const validateCodeLocally = async (
   // MANEJO DE ENTRADA (DIRECTION === 'in')
   // ----------------------------------------------------
   if (currentScans >= maxUses || codeRow.status === 'used') {
-    await db.runAsync(
+    await database.runAsync(
       'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
       [codeStr, 'duplicate', scannedAt, 'in', overrideReason]
     );
@@ -265,7 +295,7 @@ export const validateCodeLocally = async (
   if (!isAssistedWheelchair && allowedSections && allowedSections.length > 0) {
     const codeSection = metadata?.details ?? '';
     if (codeSection && !allowedSections.includes(codeSection)) {
-      await db.runAsync(
+      await database.runAsync(
         'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
         [codeStr, 'invalid_zone', scannedAt, 'in', overrideReason]
       );
@@ -284,11 +314,11 @@ export const validateCodeLocally = async (
   const isUsed = newScans >= maxUses;
   const newStatus = isUsed ? 'used' : 'pending';
 
-  await db.runAsync(
+  await database.runAsync(
     'UPDATE codes SET scans_count = ?, inside_count = ?, status = ? WHERE id = ?',
     [newScans, newInside, newStatus, codeRow.id]
   );
-  await db.runAsync(
+  await database.runAsync(
     'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
     [codeStr, 'success', scannedAt, 'in', overrideReason]
   );
@@ -323,7 +353,8 @@ export const registerCodeLocally = async (codeData: {
   auto_checkin?: boolean;
   allowedSections?: string[] | null;
 }) => {
-  if (!db) return { status: 'error', message: 'DB not initialized' };
+  const database = await getOrOpenDb();
+  if (!database) return { status: 'error', message: 'DB not initialized' };
 
   const normalizedCode = codeData.code.trim();
   const maxUses = codeData.max_uses ?? 1;
@@ -331,13 +362,13 @@ export const registerCodeLocally = async (codeData: {
   const metadata = { details: codeData.details || 'General' };
 
   // Verificar si ya existe en la base SQLite local
-  const existing = await db.getFirstAsync<{ id: number; code: string }>(
+  const existing = await database.getFirstAsync<{ id: number; code: string }>(
     'SELECT id, code FROM codes WHERE code = ?',
     [normalizedCode]
   );
 
   if (!existing) {
-    await db.runAsync(
+    await database.runAsync(
       'INSERT INTO codes (code, type, status, metadata, max_uses, scans_count, inside_count, is_external) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       [
         normalizedCode,
@@ -372,8 +403,9 @@ export const registerCodeLocally = async (codeData: {
 };
 
 export const getUnsyncedLogs = async () => {
-  if (!db) return [];
-  return await db.getAllAsync<{
+  const database = await getOrOpenDb();
+  if (!database) return [];
+  return await database.getAllAsync<{
     id: number;
     code: string;
     result: string;
@@ -384,9 +416,10 @@ export const getUnsyncedLogs = async () => {
 };
 
 export const markLogsAsSynced = async (ids: number[]) => {
-  if (!db || ids.length === 0) return;
+  const database = await getOrOpenDb();
+  if (!database || ids.length === 0) return;
   const placeholders = ids.map(() => '?').join(',');
-  await db.runAsync(`UPDATE logs SET synced = 1 WHERE id IN (${placeholders})`, ids);
+  await database.runAsync(`UPDATE logs SET synced = 1 WHERE id IN (${placeholders})`, ids);
 };
 
 export const updateCodesStatus = async (
@@ -398,26 +431,27 @@ export const updateCodesStatus = async (
     inside_count?: number;
   }[]
 ) => {
-  if (!db || deltas.length === 0) return;
+  const database = await getOrOpenDb();
+  if (!database || deltas.length === 0) return;
   try {
     for (const d of deltas) {
       if (d.scans_count !== undefined && d.inside_count !== undefined) {
-        await db.runAsync(
+        await database.runAsync(
           'UPDATE codes SET status = ?, scans_count = ?, inside_count = ?, max_uses = COALESCE(?, max_uses) WHERE code = ?',
           [d.status, d.scans_count, d.inside_count, d.max_uses ?? null, d.code]
         );
       } else if (d.scans_count !== undefined) {
-        await db.runAsync(
+        await database.runAsync(
           'UPDATE codes SET status = ?, scans_count = ?, max_uses = COALESCE(?, max_uses) WHERE code = ?',
           [d.status, d.scans_count, d.max_uses ?? null, d.code]
         );
       } else if (d.inside_count !== undefined) {
-        await db.runAsync(
+        await database.runAsync(
           'UPDATE codes SET status = ?, inside_count = ? WHERE code = ?',
           [d.status, d.inside_count, d.code]
         );
       } else {
-        await db.runAsync('UPDATE codes SET status = ? WHERE code = ?', [d.status, d.code]);
+        await database.runAsync('UPDATE codes SET status = ? WHERE code = ?', [d.status, d.code]);
       }
     }
   } catch (error) {
