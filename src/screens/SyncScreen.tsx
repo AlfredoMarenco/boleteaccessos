@@ -77,6 +77,8 @@ export default function SyncScreen({ navigation }: any) {
       });
       
       await AsyncStorage.setItem('allowed_sections', JSON.stringify(data.allowed_sections ?? null));
+      await AsyncStorage.setItem('device_group_name', data.device_group_name || '');
+      await AsyncStorage.setItem('device_group_id', data.device_group_id ? String(data.device_group_id) : '');
       if (data.features) {
         await AsyncStorage.setItem('event_features', JSON.stringify(data.features));
       }

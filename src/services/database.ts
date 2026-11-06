@@ -154,7 +154,8 @@ export const validateCodeLocally = async (
   allowedSections: string[] | null = null,
   direction: 'in' | 'out' = 'in',
   overrideReason: string | null = null,
-  nfcCandidates: string[] = []
+  nfcCandidates: string[] = [],
+  currentGroupName: string | null = null
 ) => {
   const database = await getOrOpenDb();
   if (!database) return { status: 'error', message: 'DB not initialized' };
@@ -212,11 +213,44 @@ export const validateCodeLocally = async (
   }
 
   const effectiveCode = codeRow.code || codeStr;
+  const metadata = JSON.parse(codeRow.metadata || '{}');
+
+  // Regla estricta: Si el status es null, vacío, cancelled, denied o sin_acceso -> RECHAZAR de inmediato
+  if (!codeRow.status || ['cancelled', 'denied', 'sin_acceso', 'inactive'].includes(codeRow.status.toLowerCase())) {
+    await database.runAsync(
+      'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
+      [effectiveCode, 'cancelled', scannedAt, direction, overrideReason]
+    );
+    return {
+      status: 'cancelled',
+      matched_code: effectiveCode,
+      message: 'Boleto cancelado o sin acceso.',
+      type: codeRow.type,
+      metadata,
+    };
+  }
 
   const maxUses = codeRow.max_uses ?? 1;
   const currentScans = codeRow.scans_count ?? 0;
   const currentInside = codeRow.inside_count ?? (currentScans > 0 ? 1 : 0);
-  const metadata = JSON.parse(codeRow.metadata || '{}');
+
+  // Zona permitida y herencia de grupo (para entradas y salidas)
+  const codeSection = metadata?.details ?? '';
+  const metaGroup = metadata?.group_name ?? null;
+  const metaSections: string[] = Array.isArray(metadata?.allowed_sections) ? metadata.allowed_sections : [];
+  const isExternal = codeRow.is_external === 1;
+
+  const isAllowedZone = !allowedSections || allowedSections.length === 0
+    || (codeSection && allowedSections.includes(codeSection))
+    || (metaGroup && currentGroupName && metaGroup === currentGroupName)
+    || (metaGroup && allowedSections.includes(metaGroup))
+    || (metaSections.length > 0 && metaSections.some((s: string) => allowedSections.includes(s)))
+    || (isExternal && metaGroup && currentGroupName && metaGroup === currentGroupName);
+
+  const hasZoneOverride =
+    overrideReason === 'wheelchair' ||
+    overrideReason === 'wheelchair_assisted_access' ||
+    Boolean(metadata?.assisted_zone_authorized);
 
   // ----------------------------------------------------
   // MANEJO DE SALIDA (DIRECTION === 'out')
@@ -239,13 +273,7 @@ export const validateCodeLocally = async (
       };
     }
 
-    // Validar zona permitida a menos que haya override
-    const codeSection = metadata?.details ?? '';
-    const hasZoneOverride =
-      overrideReason === 'wheelchair' ||
-      overrideReason === 'wheelchair_assisted_access' ||
-      Boolean(metadata?.assisted_zone_authorized);
-    if (!hasZoneOverride && allowedSections && allowedSections.length > 0 && codeSection && !allowedSections.includes(codeSection)) {
+    if (!hasZoneOverride && !isAllowedZone) {
       await database.runAsync(
         'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
         [effectiveCode, 'invalid_zone', scannedAt, 'out', overrideReason]
@@ -253,6 +281,7 @@ export const validateCodeLocally = async (
       return {
         status: 'invalid_zone',
         matched_code: effectiveCode,
+        direction: 'out',
         message: `Salida denegada. Este código pertenece a la zona '${codeSection}', la cual no está habilitada para esta puerta.`,
         type: codeRow.type,
         metadata,
@@ -261,7 +290,6 @@ export const validateCodeLocally = async (
 
     const newInside = Math.max(0, currentInside - 1);
     const newScans = Math.max(0, currentScans - 1);
-    // Si estaba used, se reactiva a pending para permitir reingreso
     const newStatus = 'pending';
 
     await database.runAsync(
@@ -314,30 +342,20 @@ export const validateCodeLocally = async (
     };
   }
 
-  if (codeRow.status === 'cancelled') {
-    return { status: 'cancelled', matched_code: effectiveCode, message: 'Código cancelado.', type: codeRow.type, metadata };
-  }
-
-  // Validación offline de zona (si el dispositivo tiene secciones restringidas)
-  const isAssistedWheelchair =
-    overrideReason === 'wheelchair' ||
-    overrideReason === 'wheelchair_assisted_access' ||
-    Boolean(metadata?.assisted_zone_authorized);
-  if (!isAssistedWheelchair && allowedSections && allowedSections.length > 0) {
-    const codeSection = metadata?.details ?? '';
-    if (codeSection && !allowedSections.includes(codeSection)) {
-      await database.runAsync(
-        'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-        [effectiveCode, 'invalid_zone', scannedAt, 'in', overrideReason]
-      );
-      return {
-        status: 'invalid_zone',
-        matched_code: effectiveCode,
-        message: `Acceso denegado. Este código pertenece a la zona '${codeSection}', la cual no está habilitada para esta puerta.`,
-        type: codeRow.type,
-        metadata,
-      };
-    }
+  // Validación offline de zona
+  if (!hasZoneOverride && !isAllowedZone) {
+    await database.runAsync(
+      'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
+      [effectiveCode, 'invalid_zone', scannedAt, 'in', overrideReason]
+    );
+    return {
+      status: 'invalid_zone',
+      matched_code: effectiveCode,
+      direction: 'in',
+      message: `Acceso denegado. Este código pertenece a la zona '${codeSection}', la cual no está habilitada para esta puerta.`,
+      type: codeRow.type,
+      metadata,
+    };
   }
 
   // Éxito: Incrementar contador y marcar como 'used' si llegó al límite
@@ -346,7 +364,7 @@ export const validateCodeLocally = async (
   const isUsed = newScans >= maxUses;
   const newStatus = isUsed ? 'used' : 'pending';
 
-  if (isAssistedWheelchair) {
+  if (hasZoneOverride) {
     metadata.assisted_zone_authorized = true;
   }
 
@@ -360,7 +378,7 @@ export const validateCodeLocally = async (
   );
 
   const remaining = Math.max(0, maxUses - newScans);
-  const successMsg = isAssistedWheelchair
+  const successMsg = hasZoneOverride
     ? 'Acceso concedido (Bypass Asistido / Silla de Ruedas).'
     : maxUses > 1
       ? `Acceso ${newScans} de ${maxUses} concedido.`
@@ -389,43 +407,105 @@ export const registerCodeLocally = async (codeData: {
   is_external?: boolean;
   auto_checkin?: boolean;
   allowedSections?: string[] | null;
+  group_name?: string | null;
 }) => {
   const database = await getOrOpenDb();
   if (!database) return { status: 'error', message: 'DB not initialized' };
 
   const normalizedCode = codeData.code.trim();
   const maxUses = codeData.max_uses ?? 1;
-  const codeType = codeData.type || 'Externo / Cortesía';
-  const metadata = { details: codeData.details || 'General' };
+  const codeType = codeData.type || 'Sistema Externo';
+  const inheritedZone = codeData.details || codeData.group_name || (codeData.allowedSections && codeData.allowedSections[0]) || 'General';
+  const metadata = {
+    details: inheritedZone,
+    group_name: codeData.group_name || null,
+    allowed_sections: codeData.allowedSections || [],
+    source: 'external_quick_registration',
+  };
 
   // Verificar si ya existe en la base SQLite local
-  const existing = await database.getFirstAsync<{ id: number; code: string }>(
-    'SELECT id, code FROM codes WHERE code = ?',
+  const existing = await database.getFirstAsync<{
+    id: number;
+    code: string;
+    status: string;
+    scans_count: number;
+    inside_count: number;
+    max_uses: number;
+    metadata: string;
+  }>(
+    'SELECT id, code, status, scans_count, inside_count, max_uses, metadata FROM codes WHERE code = ?',
     [normalizedCode]
   );
 
-  if (!existing) {
-    await database.runAsync(
-      'INSERT INTO codes (code, type, status, metadata, max_uses, scans_count, inside_count, is_external) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [
+  if (existing) {
+    if (!existing.status || ['cancelled', 'denied', 'sin_acceso', 'inactive'].includes(existing.status.toLowerCase())) {
+      return {
+        status: 'cancelled',
+        matched_code: normalizedCode,
+        message: 'Código cancelado o sin acceso.',
+        type: codeType,
+        metadata: JSON.parse(existing.metadata || '{}'),
+      };
+    }
+
+    const currentScans = existing.scans_count ?? 0;
+    const maxExisting = existing.max_uses ?? 1;
+
+    if (currentScans >= maxExisting || existing.status === 'used') {
+      return {
+        status: 'duplicate',
+        matched_code: normalizedCode,
+        message: 'Boleto ya registrado y utilizado previamente.',
+        scans_count: currentScans,
+        max_uses: maxExisting,
+        type: codeType,
+        metadata: JSON.parse(existing.metadata || '{}'),
+      };
+    }
+
+    if (codeData.auto_checkin) {
+      return await validateCodeLocally(
         normalizedCode,
-        codeType,
-        'pending',
-        JSON.stringify(metadata),
-        maxUses,
-        0,
-        0,
-        codeData.is_external !== false ? 1 : 0,
-      ]
-    );
+        codeData.allowedSections ?? null,
+        'in',
+        'external_quick_checkin_existing',
+        [],
+        codeData.group_name ?? null
+      );
+    }
+
+    return {
+      status: 'duplicate',
+      matched_code: normalizedCode,
+      message: 'El código ya se encuentra registrado para este evento.',
+      scans_count: currentScans,
+      max_uses: maxExisting,
+    };
   }
+
+  // Insertar nuevo registro
+  await database.runAsync(
+    'INSERT INTO codes (code, type, status, metadata, max_uses, scans_count, inside_count, is_external) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [
+      normalizedCode,
+      codeType,
+      'pending',
+      JSON.stringify(metadata),
+      maxUses,
+      0,
+      0,
+      codeData.is_external !== false ? 1 : 0,
+    ]
+  );
 
   if (codeData.auto_checkin) {
     return await validateCodeLocally(
       normalizedCode,
       codeData.allowedSections ?? null,
       'in',
-      'external_manual'
+      'external_manual',
+      [],
+      codeData.group_name ?? null
     );
   }
 

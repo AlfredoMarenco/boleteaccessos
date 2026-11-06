@@ -109,8 +109,9 @@ export default function ScannerScreen({ navigation }: any) {
   // Modal para registro de código externo
   const [isExternalModalVisible, setIsExternalModalVisible] = useState(false);
   const [extCodeInput, setExtCodeInput] = useState('');
-  const [extType, setExtType] = useState('Cortesía Externa');
+  const [extType, setExtType] = useState('Sistema Externo');
   const [extZone, setExtZone] = useState('General');
+  const [deviceGroupName, setDeviceGroupName] = useState('');
   const [isSavingExternal, setIsSavingExternal] = useState(false);
 
   const inputRef = useRef<TextInput>(null);
@@ -142,6 +143,10 @@ export default function ScannerScreen({ navigation }: any) {
       if (sectionsStr) {
         const parsed = JSON.parse(sectionsStr);
         setAllowedSections(Array.isArray(parsed) ? parsed : null);
+      }
+      const groupNameStr = await AsyncStorage.getItem('device_group_name');
+      if (groupNameStr) {
+        setDeviceGroupName(groupNameStr);
       }
       const info = await AsyncStorage.getItem('device_info');
       if (info) {
@@ -303,7 +308,7 @@ export default function ScannerScreen({ navigation }: any) {
         const barcode = intent['com.symbol.datawedge.data_string'];
         if (barcode && !isValidatingRef.current) {
           if (isExternalModalVisible) {
-            setExtCodeInput(barcode.trim());
+            handleSaveExternalCode(true, barcode.trim());
           } else {
             handleProcessCode(barcode, scanMode);
           }
@@ -314,7 +319,7 @@ export default function ScannerScreen({ navigation }: any) {
     return () => {
       scanSubscription.remove();
     };
-  }, [eventId, isConnected, isForcedOffline, allowedSections, scanMode, isExternalModalVisible]);
+  }, [eventId, isConnected, isForcedOffline, allowedSections, scanMode, isExternalModalVisible, deviceGroupName]);
 
   // Inicializar y escuchar antena NFC (Zebra / Android) cuando el evento lo habilita
   useEffect(() => {
@@ -349,8 +354,8 @@ export default function ScannerScreen({ navigation }: any) {
       lastNfcScanRef.current = { key: dedupKey, time: now };
 
       if (isExternalModalVisible) {
-        setExtCodeInput(nfcEvent.code);
         Vibration.vibrate(60);
+        handleSaveExternalCode(true, nfcEvent.code);
         return;
       }
 
@@ -961,23 +966,31 @@ export default function ScannerScreen({ navigation }: any) {
     );
   };
 
-  // Guardar código externo al vuelo
-  const handleSaveExternalCode = async (autoCheckin: boolean) => {
-    const codeToRegister = extCodeInput.trim();
+  // Guardar código externo al vuelo (modo rápido simplificado a 1 solo paso)
+  const handleSaveExternalCode = async (autoCheckin: boolean, overrideCode?: string) => {
+    const codeToRegister = (overrideCode !== undefined ? overrideCode : extCodeInput).trim();
     if (!codeToRegister) {
       Alert.alert('Código Requerido', 'Por favor ingresa o escanea el código del boleto.');
       return;
     }
 
+    if (isValidatingRef.current) return;
+    isValidatingRef.current = true;
     setIsSavingExternal(true);
+    setIsExternalModalVisible(false);
+    setExtCodeInput('');
+    setScanned(true);
+
+    const inheritedZone = deviceGroupName || (allowedSections && allowedSections.length > 0 ? allowedSections[0] : 'General');
+
     try {
       if (isConnected && eventId && !isForcedOffline) {
         try {
           const resp = await registerExternalCode({
             event_id: eventId,
             code: codeToRegister,
-            type: extType,
-            details: extZone,
+            type: 'Sistema Externo',
+            details: inheritedZone,
             max_uses: 1,
             auto_checkin: autoCheckin,
           });
@@ -985,11 +998,13 @@ export default function ScannerScreen({ navigation }: any) {
           // Registrar también en DB SQLite local
           await registerCodeLocally({
             code: codeToRegister,
-            type: extType,
-            details: extZone,
+            type: 'Sistema Externo',
+            details: inheritedZone,
             max_uses: 1,
             is_external: true,
             auto_checkin: false,
+            group_name: deviceGroupName,
+            allowedSections,
           });
 
           if (autoCheckin) {
@@ -1000,56 +1015,98 @@ export default function ScannerScreen({ navigation }: any) {
                 scans_count: 1,
                 inside_count: 1,
                 max_uses: 1,
+                metadata: {
+                  details: inheritedZone,
+                  group_name: deviceGroupName,
+                  allowed_sections: allowedSections || [],
+                },
               },
             ]);
           }
 
-          setIsExternalModalVisible(false);
-          setExtCodeInput('');
           resetScanner();
+          setLastScannedCode(codeToRegister);
 
           if (autoCheckin) {
             setResult({
-              status: 'success',
+              status: resp.status || 'success',
               direction: 'in',
-              message: `Boleto externo registrado y acceso concedido: ${codeToRegister}`,
-              type: extType,
-              metadata: { details: extZone },
-              scans_count: 1,
-              max_uses: 1,
-              remaining_scans: 0,
+              message: resp.message || `Boleto guardado y acceso concedido: ${codeToRegister}`,
+              type: 'Sistema Externo',
+              metadata: { details: inheritedZone, group_name: deviceGroupName },
+              scans_count: resp.scans_count ?? 1,
+              max_uses: resp.max_uses ?? 1,
+              remaining_scans: resp.remaining_scans ?? 0,
+              duplicate_info: resp.duplicate_info,
             });
-            playSound('success');
-            Vibration.vibrate(100);
+
+            if (resp.status === 'success') {
+              playSound('success');
+              Vibration.vibrate(100);
+              if (successTimeoutRef.current) clearTimeout(successTimeoutRef.current);
+              successTimeoutRef.current = setTimeout(() => {
+                resetScanner();
+              }, 1800);
+            } else if (resp.status === 'duplicate') {
+              playSound('warning');
+              Vibration.vibrate([0, 200, 100, 200]);
+            } else {
+              playSound('error');
+              Vibration.vibrate([0, 200, 100, 200]);
+            }
           } else {
-            Alert.alert('Éxito', `Código ${codeToRegister} registrado correctamente en el servidor.`);
+            Alert.alert('Éxito', `Código ${codeToRegister} guardado correctamente.`);
           }
+
+          refreshUnsyncedCount();
           return;
         } catch (netErr: any) {
-          console.log('Fallo registro online de código externo, registrando en SQLite local:', netErr);
+          console.log('Fallo registro online de código externo, procediendo offline:', netErr);
+          const errData = netErr.response?.data;
+          if (errData && (errData.status === 'duplicate' || errData.status === 'cancelled')) {
+            resetScanner();
+            setLastScannedCode(codeToRegister);
+            setResult({
+              status: errData.status,
+              direction: 'in',
+              message: errData.message,
+              type: 'Sistema Externo',
+              duplicate_info: errData.duplicate_info,
+            });
+            playSound(errData.status === 'duplicate' ? 'warning' : 'error');
+            Vibration.vibrate([0, 200, 100, 200]);
+            return;
+          }
         }
       }
 
       // Registro Offline en SQLite
       const localResult = await registerCodeLocally({
         code: codeToRegister,
-        type: extType,
-        details: extZone,
+        type: 'Sistema Externo',
+        details: inheritedZone,
         max_uses: 1,
         is_external: true,
         auto_checkin: autoCheckin,
         allowedSections,
+        group_name: deviceGroupName,
       });
 
-      setIsExternalModalVisible(false);
-      setExtCodeInput('');
       resetScanner();
+      setLastScannedCode(codeToRegister);
 
       if (autoCheckin) {
         setResult(localResult);
         if (localResult.status === 'success') {
           playSound('success');
           Vibration.vibrate(100);
+          if (successTimeoutRef.current) clearTimeout(successTimeoutRef.current);
+          successTimeoutRef.current = setTimeout(() => {
+            resetScanner();
+          }, 1800);
+        } else if (localResult.status === 'duplicate') {
+          playSound('warning');
+          Vibration.vibrate([0, 200, 100, 200]);
         } else {
           playSound('error');
           Vibration.vibrate([0, 200, 100, 200]);
@@ -1067,6 +1124,7 @@ export default function ScannerScreen({ navigation }: any) {
       Alert.alert('Error', `No se pudo registrar el código: ${e.message}`);
     } finally {
       setIsSavingExternal(false);
+      isValidatingRef.current = false;
     }
   };
 
@@ -1349,15 +1407,13 @@ export default function ScannerScreen({ navigation }: any) {
           </View>
         </ScrollView>
 
-        {result.status !== 'success' ? (
-          <View style={styles.resultFooter}>
-            <TouchableOpacity style={styles.btnNext} onPress={() => resetScanner()}>
-              <RefreshCcw color="#fff" size={24} />
-              <Text style={styles.btnNextText}>CONTINUAR ESCANEANDO</Text>
-            </TouchableOpacity>
-            <Text style={styles.triggerHint}>O presiona el gatillo del scanner</Text>
-          </View>
-        ) : null}
+        <View style={styles.resultFooter}>
+          <TouchableOpacity style={styles.btnNext} onPress={() => resetScanner()}>
+            <RefreshCcw color="#fff" size={24} />
+            <Text style={styles.btnNextText}>CONTINUAR ESCANEANDO</Text>
+          </TouchableOpacity>
+          <Text style={styles.triggerHint}>O presiona el gatillo del scanner</Text>
+        </View>
       </View>
     );
   };
@@ -1447,15 +1503,18 @@ export default function ScannerScreen({ navigation }: any) {
         </View>
       ) : null}
 
-      {/* Botón flotante para Registro de Código Externo al vuelo */}
+      {/* Botón flotante para Guardar Código Directo */}
       {eventFeatures?.allow_external_code_registration && !result ? (
         <TouchableOpacity
           style={styles.btnExternalFloating}
-          onPress={() => setIsExternalModalVisible(true)}
+          onPress={() => {
+            setExtCodeInput('');
+            setIsExternalModalVisible(true);
+          }}
           activeOpacity={0.85}
         >
           <UserPlus color="#fff" size={20} />
-          <Text style={styles.btnExternalFloatingText}>+ Cód. Externo</Text>
+          <Text style={styles.btnExternalFloatingText}>GUARDAR</Text>
         </TouchableOpacity>
       ) : null}
 
@@ -1544,93 +1603,87 @@ export default function ScannerScreen({ navigation }: any) {
 
       {renderResult()}
 
-      {/* Modal de Registro de Código Externo */}
+      {/* Modal / Overlay de 1 solo paso: Modo GUARDAR CÓDIGO */}
       <Modal
         visible={isExternalModalVisible}
         transparent={true}
-        animationType="slide"
+        animationType="fade"
         onRequestClose={() => setIsExternalModalVisible(false)}
       >
         <View style={styles.modalBackdrop}>
-          <View style={styles.modalContent}>
+          <View style={styles.quickModalContent}>
             <View style={styles.modalHeader}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                <UserPlus color={colors.primary} size={24} />
-                <Text style={styles.modalTitle}>Registrar Código Externo</Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                <View style={styles.quickIconCircle}>
+                  <UserPlus color="#c90000" size={24} />
+                </View>
+                <View>
+                  <Text style={styles.modalTitle}>MODO GUARDAR</Text>
+                  <Text style={{ fontSize: 12, color: colors.textMuted }}>Escaneo y validación directa</Text>
+                </View>
               </View>
-              <TouchableOpacity onPress={() => setIsExternalModalVisible(false)}>
-                <X color={colors.text} size={24} />
-              </TouchableOpacity>
-            </View>
-
-            <Text style={styles.modalSubtitle}>
-              {eventFeatures?.allow_nfc_access
-                ? 'Escanea con láser, acerca la pulsera/tarjeta NFC o ingresa el código para autorizar su ingreso.'
-                : 'Escanea o ingresa el boleto de otro sistema para autorizar su ingreso al recinto.'}
-            </Text>
-
-            <Text style={styles.label}>Código de Boleto / Barra:</Text>
-            <TextInput
-              style={styles.textInput}
-              value={extCodeInput}
-              onChangeText={setExtCodeInput}
-              placeholder="Ej. EXT-123456 o escanear"
-              placeholderTextColor="#94a3b8"
-              autoCapitalize="characters"
-              autoFocus
-            />
-
-            <Text style={styles.label}>Tipo de Cortesía / Pase:</Text>
-            <View style={styles.typeSelector}>
-              {['Cortesía Externa', 'Silla de Ruedas', 'Otro Sistema'].map((t) => (
-                <TouchableOpacity
-                  key={t}
-                  style={[styles.typeButton, extType === t && styles.typeButtonSelected]}
-                  onPress={() => setExtType(t)}
-                >
-                  <Text style={[styles.typeButtonText, extType === t && styles.typeButtonTextSelected]}>
-                    {t}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-
-            <Text style={styles.label}>Zona / Sección Asignada:</Text>
-            <View style={styles.typeSelector}>
-              {['General', 'VIP', 'Gradas', 'Ruedo'].map((z) => (
-                <TouchableOpacity
-                  key={z}
-                  style={[styles.typeButton, extZone === z && styles.typeButtonSelected]}
-                  onPress={() => setExtZone(z)}
-                >
-                  <Text style={[styles.typeButtonText, extZone === z && styles.typeButtonTextSelected]}>
-                    {z}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-
-            <View style={styles.modalActions}>
               <TouchableOpacity
-                style={[styles.btnActionSecondary, isSavingExternal && { opacity: 0.6 }]}
-                onPress={() => handleSaveExternalCode(false)}
-                disabled={isSavingExternal}
+                onPress={() => setIsExternalModalVisible(false)}
+                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
               >
-                <Text style={styles.btnActionSecondaryText}>Solo Guardar</Text>
+                <X color={colors.text} size={26} />
               </TouchableOpacity>
+            </View>
 
+            {/* Indicador de Zona / Puerta / Grupo asignado */}
+            <View style={styles.quickGroupBadge}>
+              <Text style={styles.quickGroupLabel}>📍 PUERTA / GRUPO VINCULADO:</Text>
+              <Text style={styles.quickGroupName}>
+                {deviceGroupName || (allowedSections && allowedSections.length > 0 ? allowedSections.join(', ') : 'Acceso Total')}
+              </Text>
+              <Text style={styles.quickGroupHint}>
+                El código guardado quedará autorizado en esta zona para entrada y salida.
+              </Text>
+            </View>
+
+            {/* Prompt de escaneo con láser Zebra o NFC */}
+            <View style={styles.quickScanPromptBox}>
+              <ActivityIndicator size="small" color="#c90000" style={{ marginBottom: 6 }} />
+              <Text style={styles.quickScanPromptTitle}>
+                DISPARA EL LÁSER O ACERCA LA PULSERA
+              </Text>
+              <Text style={styles.quickScanPromptSubtitle}>
+                Se registrará y dará acceso automáticamente en un solo paso.
+              </Text>
+            </View>
+
+            <Text style={styles.label}>O ingresa el código manualmente:</Text>
+            <View style={{ flexDirection: 'row', gap: 8, marginBottom: 15 }}>
+              <TextInput
+                style={[styles.textInput, { flex: 1, marginBottom: 0 }]}
+                value={extCodeInput}
+                onChangeText={setExtCodeInput}
+                onSubmitEditing={() => handleSaveExternalCode(true)}
+                placeholder="Ej. EXT-123456"
+                placeholderTextColor="#94a3b8"
+                autoCapitalize="characters"
+                autoFocus
+                returnKeyType="done"
+              />
               <TouchableOpacity
-                style={[styles.btnActionPrimary, isSavingExternal && { opacity: 0.6 }]}
+                style={[styles.btnQuickSave, isSavingExternal && { opacity: 0.6 }]}
                 onPress={() => handleSaveExternalCode(true)}
                 disabled={isSavingExternal}
               >
                 {isSavingExternal ? (
                   <ActivityIndicator color="#fff" size="small" />
                 ) : (
-                  <Text style={styles.btnActionPrimaryText}>Guardar y Dar Entrada</Text>
+                  <Text style={styles.btnQuickSaveText}>GUARDAR</Text>
                 )}
               </TouchableOpacity>
             </View>
+
+            <TouchableOpacity
+              style={styles.btnCancelQuick}
+              onPress={() => setIsExternalModalVisible(false)}
+            >
+              <Text style={styles.btnCancelQuickText}>CANCELAR / VOLVER</Text>
+            </TouchableOpacity>
           </View>
         </View>
       </Modal>
@@ -1888,15 +1941,107 @@ const styles = StyleSheet.create({
   // Estilos del Modal
   modalBackdrop: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.7)',
+    backgroundColor: 'rgba(0,0,0,0.75)',
     justifyContent: 'center',
-    padding: 20,
+    padding: 18,
   },
   modalContent: {
     backgroundColor: '#ffffff',
     borderRadius: 16,
     padding: 20,
     elevation: 10,
+  },
+  quickModalContent: {
+    backgroundColor: '#ffffff',
+    borderRadius: 20,
+    padding: 20,
+    elevation: 12,
+    borderWidth: 1.5,
+    borderColor: '#e2e8f0',
+  },
+  quickIconCircle: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: '#fee2e2',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  quickGroupBadge: {
+    backgroundColor: '#f8fafc',
+    borderRadius: 12,
+    padding: 14,
+    borderWidth: 1.5,
+    borderColor: '#cbd5e1',
+    marginTop: 10,
+    marginBottom: 14,
+  },
+  quickGroupLabel: {
+    fontSize: 11,
+    fontWeight: '800',
+    color: '#64748b',
+    letterSpacing: 0.5,
+    marginBottom: 4,
+  },
+  quickGroupName: {
+    fontSize: 18,
+    fontWeight: '900',
+    color: '#0f172a',
+  },
+  quickGroupHint: {
+    fontSize: 12,
+    color: '#64748b',
+    marginTop: 4,
+    lineHeight: 16,
+  },
+  quickScanPromptBox: {
+    backgroundColor: '#fff1f2',
+    borderRadius: 14,
+    padding: 16,
+    borderWidth: 1.5,
+    borderColor: '#fecdd3',
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  quickScanPromptTitle: {
+    fontSize: 14,
+    fontWeight: '900',
+    color: '#991b1b',
+    textAlign: 'center',
+    letterSpacing: 0.5,
+  },
+  quickScanPromptSubtitle: {
+    fontSize: 12,
+    color: '#b91c1c',
+    textAlign: 'center',
+    marginTop: 4,
+  },
+  btnQuickSave: {
+    backgroundColor: '#c90000',
+    paddingHorizontal: 20,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 2,
+  },
+  btnQuickSaveText: {
+    color: '#ffffff',
+    fontWeight: '900',
+    fontSize: 14,
+    letterSpacing: 0.5,
+  },
+  btnCancelQuick: {
+    backgroundColor: '#f1f5f9',
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+  },
+  btnCancelQuickText: {
+    color: '#475569',
+    fontWeight: '800',
+    fontSize: 13,
   },
   modalHeader: {
     flexDirection: 'row',
