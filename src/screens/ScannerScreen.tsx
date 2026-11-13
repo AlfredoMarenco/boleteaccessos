@@ -28,6 +28,7 @@ import {
   markLogsAsSynced,
   updateCodesStatus,
   registerCodeLocally,
+  extractNormalizedCode,
   getDb,
 } from '../services/database';
 import {
@@ -116,6 +117,8 @@ export default function ScannerScreen({ navigation }: any) {
 
   const inputRef = useRef<TextInput>(null);
   const isValidatingRef = useRef(false);
+  const isSavingExternalRef = useRef(false);
+  const lastExternalSaveRef = useRef<{ code: string; time: number }>({ code: '', time: 0 });
   const successTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
@@ -184,20 +187,20 @@ export default function ScannerScreen({ navigation }: any) {
 
   useEffect(() => {
     // Foco constante en el TextInput para el hardware Zebra / DataWedge
-    if (inputRef.current) {
+    if (inputRef.current && !isExternalModalVisible) {
       inputRef.current.focus();
     }
 
     const t1 = setTimeout(() => {
-      if (inputRef.current) inputRef.current.focus();
+      if (inputRef.current && !isExternalModalVisible) inputRef.current.focus();
     }, 100);
 
     const t2 = setTimeout(() => {
-      if (inputRef.current) inputRef.current.focus();
+      if (inputRef.current && !isExternalModalVisible) inputRef.current.focus();
     }, 300);
 
     const t3 = setTimeout(() => {
-      if (inputRef.current) inputRef.current.focus();
+      if (inputRef.current && !isExternalModalVisible) inputRef.current.focus();
     }, 600);
 
     const interval = setInterval(() => {
@@ -306,7 +309,7 @@ export default function ScannerScreen({ navigation }: any) {
     const scanSubscription = DeviceEventEmitter.addListener('datawedge_broadcast_intent', (intent) => {
       if (intent.hasOwnProperty('com.symbol.datawedge.data_string')) {
         const barcode = intent['com.symbol.datawedge.data_string'];
-        if (barcode && !isValidatingRef.current) {
+        if (barcode && !isValidatingRef.current && !isSavingExternalRef.current) {
           if (isExternalModalVisible) {
             handleSaveExternalCode(true, barcode.trim());
           } else {
@@ -319,7 +322,16 @@ export default function ScannerScreen({ navigation }: any) {
     return () => {
       scanSubscription.remove();
     };
-  }, [eventId, isConnected, isForcedOffline, allowedSections, scanMode, isExternalModalVisible, deviceGroupName]);
+  }, [
+    eventId,
+    isConnected,
+    isForcedOffline,
+    allowedSections,
+    scanMode,
+    isExternalModalVisible,
+    deviceGroupName,
+    eventFeatures,
+  ]);
 
   // Inicializar y escuchar antena NFC (Zebra / Android) cuando el evento lo habilita
   useEffect(() => {
@@ -425,6 +437,8 @@ export default function ScannerScreen({ navigation }: any) {
         scanned_at: l.scanned_at,
         direction: l.direction || 'in',
         override_reason: l.override_reason || null,
+        scan_method: l.scan_method || 'barcode',
+        is_external: l.is_external === 1,
       }));
 
       await syncLogs(eventId, formattedLogs);
@@ -497,7 +511,8 @@ export default function ScannerScreen({ navigation }: any) {
     if (!code) return;
     if (isValidatingRef.current) return;
 
-    setLastScannedCode(code);
+    const normalizedCode = extractNormalizedCode(code);
+    setLastScannedCode(normalizedCode);
 
     if (scanned || result) {
       setResult(null);
@@ -522,157 +537,54 @@ export default function ScannerScreen({ navigation }: any) {
       console.log('Error deshabilitando DataWedge', err);
     }
 
+    // Candados de funcionalidades del evento (idénticos en línea y fuera de línea)
+    if (scanMethod === 'nfc' && !eventFeatures?.allow_nfc_access) {
+      setResult({
+        status: 'error',
+        direction: currentDirection,
+        message: 'El evento no tiene habilitada la lectura de accesos por NFC.',
+        scan_method: scanMethod,
+      });
+      isValidatingRef.current = false;
+      Vibration.vibrate([0, 200, 100, 200]);
+      playSound('error');
+      return;
+    }
+
+    if (currentDirection === 'out' && !eventFeatures?.allow_exit_reentry) {
+      setResult({
+        status: 'error',
+        direction: currentDirection,
+        message: 'El evento no tiene habilitado el control de salidas y reingresos.',
+        scan_method: scanMethod,
+      });
+      isValidatingRef.current = false;
+      Vibration.vibrate([0, 200, 100, 200]);
+      playSound('error');
+      return;
+    }
+
     let validationResult: any;
 
-    // 1. Pre-check local offline
-    const localDb = getDb();
-    if (localDb && !allowOverride) {
-      try {
-        let codeRow = await localDb.getFirstAsync<{
-          code: string;
-          status: string;
-          type: string;
-          metadata: string;
-          max_uses: number;
-          scans_count: number;
-          inside_count: number;
-        }>(
-          'SELECT code, status, type, metadata, max_uses, scans_count, inside_count FROM codes WHERE code = ?',
-          [code]
-        );
-
-        if (!codeRow && scanMethod === 'nfc' && nfcCandidates.length > 0) {
-          const placeholders = nfcCandidates.map(() => '?').join(',');
-          codeRow = await localDb.getFirstAsync<{
-            code: string;
-            status: string;
-            type: string;
-            metadata: string;
-            max_uses: number;
-            scans_count: number;
-            inside_count: number;
-          }>(
-            `SELECT code, status, type, metadata, max_uses, scans_count, inside_count FROM codes WHERE code IN (${placeholders}) LIMIT 1`,
-            nfcCandidates
+    // Si hay logs offline pendientes para este código y estamos online, sincronizarlos antes de validar contra el servidor
+    if (isConnected && eventId && !isForcedOffline) {
+      const localDb = getDb();
+      if (localDb) {
+        try {
+          const pendingForCode = await localDb.getFirstAsync<{ cnt: number }>(
+            'SELECT COUNT(*) as cnt FROM logs WHERE code = ? AND synced = 0',
+            [normalizedCode]
           );
-          if (codeRow?.code) {
-            code = codeRow.code;
-            setLastScannedCode(code);
+          if (pendingForCode && pendingForCode.cnt > 0) {
+            await attemptAutoSync();
           }
+        } catch (e) {
+          console.log('Error checking pending logs for code:', e);
         }
-
-        if (codeRow) {
-          const metadata = JSON.parse(codeRow.metadata || '{}');
-          const codeSection = metadata?.details ?? '';
-          const maxUses = codeRow.max_uses ?? 1;
-          const currentScans = codeRow.scans_count ?? 0;
-          const currentInside = codeRow.inside_count ?? (currentScans > 0 ? 1 : 0);
-
-          // Si es salida y no está adentro
-          if (currentDirection === 'out' && currentInside <= 0) {
-            await localDb.runAsync(
-              'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-              [code, 'cannot_exit_not_inside', new Date().toISOString(), 'out', null]
-            );
-            validationResult = {
-              status: 'cannot_exit_not_inside',
-              direction: 'out',
-              message: 'No se puede dar salida: este boleto no ha registrado entrada previa.',
-              type: codeRow.type,
-              metadata,
-            };
-            setResult(validationResult);
-            Vibration.vibrate([0, 200, 100, 200]);
-            playSound('error');
-            setLaserInput('');
-            refreshUnsyncedCount();
-            attemptAutoSync();
-            isValidatingRef.current = false;
-            return;
-          }
-
-          // Verificar candado de sección (si no hay override ni autorización asistida previa)
-          const isAlreadyAssisted = Boolean(metadata?.assisted_zone_authorized);
-          if (
-            !isAlreadyAssisted &&
-            allowedSections &&
-            allowedSections.length > 0 &&
-            codeSection &&
-            !allowedSections.includes(codeSection)
-          ) {
-            await localDb.runAsync(
-              'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-              [code, 'invalid_zone', new Date().toISOString(), currentDirection, null]
-            );
-            validationResult = {
-              status: 'invalid_zone',
-              direction: currentDirection,
-              message: `Acceso denegado. Este código pertenece a la zona '${codeSection}', la cual no está habilitada para esta puerta.`,
-              metadata,
-            };
-            setResult(validationResult);
-            Vibration.vibrate([0, 200, 100, 200]);
-            playSound('warning');
-            setLaserInput('');
-            refreshUnsyncedCount();
-            attemptAutoSync();
-            isValidatingRef.current = false;
-            return;
-          }
-
-          // Si es entrada y ya agotó accesos
-          if (currentDirection === 'in' && (currentScans >= maxUses || codeRow.status === 'used')) {
-            await localDb.runAsync(
-              'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-              [code, 'duplicate', new Date().toISOString(), 'in', null]
-            );
-            const duplicateMsg =
-              maxUses > 1
-                ? `Límite de accesos alcanzado localmente (${currentScans} de ${maxUses}).`
-                : 'Código ya utilizado localmente.';
-            validationResult = {
-              status: 'duplicate',
-              direction: 'in',
-              message: duplicateMsg,
-              scans_count: currentScans,
-              max_uses: maxUses,
-              type: codeRow.type,
-              metadata,
-            };
-            setResult(validationResult);
-            Vibration.vibrate([0, 200, 100, 200]);
-            playSound('error');
-            setLaserInput('');
-            refreshUnsyncedCount();
-            attemptAutoSync();
-            isValidatingRef.current = false;
-            return;
-          }
-
-          // Si está cancelado localmente
-          if (codeRow.status === 'cancelled') {
-            validationResult = {
-              status: 'cancelled',
-              message: 'Código cancelado en el sistema.',
-              type: codeRow.type,
-              metadata,
-            };
-            setResult(validationResult);
-            Vibration.vibrate([0, 200, 100, 200]);
-            playSound('error');
-            setLaserInput('');
-            refreshUnsyncedCount();
-            attemptAutoSync();
-            isValidatingRef.current = false;
-            return;
-          }
-        }
-      } catch (dbError) {
-        console.log('Error local pre-check:', dbError);
       }
     }
 
-    // 2. Validación Online u Offline
+    // Validación Online (servidor como fuente de verdad) o Fallback Local Offline (con reglas idénticas)
     if (isConnected && eventId && !isForcedOffline) {
       try {
         const response = await validateCodeOnline(
@@ -686,113 +598,67 @@ export default function ScannerScreen({ navigation }: any) {
           nfcCandidates
         );
         consecutiveNetworkFailures.current = 0;
-        const targetCode = response.matched_code || code;
-        if (response.matched_code) {
-          setLastScannedCode(response.matched_code);
-        }
+        const targetCode = response.matched_code || normalizedCode;
+        setLastScannedCode(targetCode);
 
-        // Post-check online de sección si no hubo override
-        if (
-          !allowOverride &&
-          response.status === 'success' &&
-          allowedSections &&
-          allowedSections.length > 0
-        ) {
-          const metadata = response.metadata || {};
-          const codeSection = metadata.details ?? '';
-          const isAlreadyAssisted = Boolean(metadata?.assisted_zone_authorized);
-          if (!isAlreadyAssisted && codeSection && !allowedSections.includes(codeSection)) {
-            validationResult = {
-              status: 'invalid_zone',
-              direction: currentDirection,
-              message: `Acceso denegado. Este código pertenece a la zona '${codeSection}', la cual no está habilitada para esta puerta.`,
-              metadata,
-            };
-            const ldb = getDb();
-            if (ldb) {
-              await ldb.runAsync(
-                'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-                [targetCode, 'invalid_zone', new Date().toISOString(), currentDirection, overrideReason]
-              );
-            }
-          } else {
-            validationResult = response;
-            const isFinal = response.remaining_scans === 0;
-            await updateCodesStatus([
-              {
-                code: targetCode,
-                status: isFinal ? 'used' : 'pending',
-                scans_count: response.scans_count,
-                inside_count: response.inside_count,
-                max_uses: response.max_uses,
-                metadata: response.metadata,
-              },
-            ]);
-          }
-        } else {
-          validationResult = response;
-          if (validationResult.status === 'success') {
-            const isFinal = response.remaining_scans === 0;
-            const updatedMetadata = allowOverride
-              ? { ...(response.metadata || {}), assisted_zone_authorized: true }
-              : response.metadata;
-            await updateCodesStatus([
-              {
-                code: targetCode,
-                status: isFinal ? 'used' : 'pending',
-                scans_count: response.scans_count,
-                inside_count: response.inside_count,
-                max_uses: response.max_uses,
-                metadata: updatedMetadata,
-              },
-            ]);
-          }
+        validationResult = response;
+        if (validationResult.status === 'success') {
+          const isFinal = response.remaining_scans === 0 && currentDirection === 'in';
+          const updatedMetadata = allowOverride
+            ? { ...(response.metadata || {}), assisted_zone_authorized: true }
+            : response.metadata;
+          await updateCodesStatus([
+            {
+              code: targetCode,
+              status: isFinal ? 'used' : 'pending',
+              scans_count: response.scans_count,
+              inside_count: response.inside_count,
+              max_uses: response.max_uses,
+              metadata: updatedMetadata,
+            },
+          ]);
         }
       } catch (error: any) {
         console.log('Online validation error:', error.message);
         if (error.response && error.response.data && error.response.data.status) {
           consecutiveNetworkFailures.current = 0;
           validationResult = error.response.data;
-          const errTargetCode = validationResult.matched_code || code;
+          const errTargetCode = validationResult.matched_code || normalizedCode;
+          setLastScannedCode(errTargetCode);
 
-          const metadata = validationResult.metadata || {};
-          const codeSection = metadata.details ?? '';
-          const isAlreadyAssisted = Boolean(metadata?.assisted_zone_authorized);
-          if (
-            !allowOverride &&
-            !isAlreadyAssisted &&
-            allowedSections &&
-            allowedSections.length > 0 &&
-            codeSection &&
-            !allowedSections.includes(codeSection)
+          if (validationResult.status === 'duplicate') {
+            await updateCodesStatus([
+              {
+                code: errTargetCode,
+                status: 'used',
+                scans_count: validationResult.scans_count,
+                inside_count: validationResult.inside_count,
+                max_uses: validationResult.max_uses,
+                metadata: validationResult.metadata,
+              },
+            ]);
+          } else if (validationResult.status === 'cancelled') {
+            await updateCodesStatus([
+              {
+                code: errTargetCode,
+                status: 'cancelled',
+                metadata: validationResult.metadata,
+              },
+            ]);
+          } else if (
+            validationResult.scans_count !== undefined ||
+            validationResult.inside_count !== undefined
           ) {
-            validationResult = {
-              status: 'invalid_zone',
-              direction: currentDirection,
-              message: `Acceso denegado. Este código pertenece a la zona '${codeSection}', la cual no está habilitada para esta puerta.`,
-              metadata,
-            };
-            const ldb = getDb();
-            if (ldb) {
-              await ldb.runAsync(
-                'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-                [errTargetCode, 'invalid_zone', new Date().toISOString(), currentDirection, overrideReason]
-              );
-            }
-          } else {
-            if (validationResult.status === 'duplicate') {
-              await updateCodesStatus([
-                {
-                  code: errTargetCode,
-                  status: 'used',
-                  scans_count: validationResult.scans_count,
-                  inside_count: validationResult.inside_count,
-                  max_uses: validationResult.max_uses,
-                },
-              ]);
-            } else if (validationResult.status === 'cancelled') {
-              await updateCodesStatus([{ code: errTargetCode, status: 'cancelled' }]);
-            }
+            await updateCodesStatus([
+              {
+                code: errTargetCode,
+                status: 'pending',
+                scans_count: validationResult.scans_count,
+                inside_count: validationResult.inside_count,
+                max_uses: validationResult.max_uses,
+                metadata: validationResult.metadata,
+              },
+            ]);
           }
         } else {
           console.log('Connection error during online validation, falling back to local');
@@ -813,7 +679,11 @@ export default function ScannerScreen({ navigation }: any) {
             allowOverride ? null : allowedSections,
             currentDirection,
             overrideReason,
-            scanMethod === 'nfc' ? nfcCandidates : []
+            scanMethod === 'nfc' ? nfcCandidates : [],
+            deviceGroupName,
+            allowOverride,
+            scanMethod,
+            Boolean(eventFeatures?.allow_assisted_zone_override)
           );
           if (validationResult?.matched_code) {
             setLastScannedCode(validationResult.matched_code);
@@ -826,7 +696,11 @@ export default function ScannerScreen({ navigation }: any) {
         allowOverride ? null : allowedSections,
         currentDirection,
         overrideReason,
-        scanMethod === 'nfc' ? nfcCandidates : []
+        scanMethod === 'nfc' ? nfcCandidates : [],
+        deviceGroupName,
+        allowOverride,
+        scanMethod,
+        Boolean(eventFeatures?.allow_assisted_zone_override)
       );
       if (validationResult?.matched_code) {
         setLastScannedCode(validationResult.matched_code);
@@ -966,63 +840,99 @@ export default function ScannerScreen({ navigation }: any) {
     );
   };
 
-  // Guardar código externo al vuelo (modo rápido simplificado a 1 solo paso)
+  // Guardar código externo al vuelo (modo rápido simplificado a 1 solo paso, prohibido guardar más de 1 vez)
   const handleSaveExternalCode = async (autoCheckin: boolean, overrideCode?: string) => {
-    const codeToRegister = (overrideCode !== undefined ? overrideCode : extCodeInput).trim();
+    const rawToRegister = (overrideCode !== undefined ? overrideCode : extCodeInput)
+      .trim()
+      .split(/[\r\n]+/)[0];
+    const codeToRegister = extractNormalizedCode(rawToRegister);
     if (!codeToRegister) {
       Alert.alert('Código Requerido', 'Por favor ingresa o escanea el código del boleto.');
       return;
     }
 
-    if (isValidatingRef.current) return;
+    const now = Date.now();
+    if (
+      isSavingExternalRef.current ||
+      isValidatingRef.current ||
+      (lastExternalSaveRef.current.code === codeToRegister &&
+        now - lastExternalSaveRef.current.time < 2500)
+    ) {
+      return;
+    }
+
+    isSavingExternalRef.current = true;
+    lastExternalSaveRef.current = { code: codeToRegister, time: now };
     isValidatingRef.current = true;
     setIsSavingExternal(true);
     setIsExternalModalVisible(false);
     setExtCodeInput('');
     setScanned(true);
 
-    const inheritedZone = deviceGroupName || (allowedSections && allowedSections.length > 0 ? allowedSections[0] : 'General');
+    const inheritedZone =
+      deviceGroupName ||
+      (allowedSections && allowedSections.length > 0 ? allowedSections[0] : 'General');
 
     try {
+      // Si el código ya fue guardado localmente sin sincronizar, primero intentamos subir logs pendientes
+      // o rechazamos directamente en local para jamás permitir guardarlo 2 veces.
+      const localDb = getDb();
+      if (localDb) {
+        const existingLocal = await localDb.getFirstAsync<{
+          code: string;
+          status: string;
+        }>('SELECT code, status FROM codes WHERE code = ?', [codeToRegister]);
+
+        if (existingLocal) {
+          // Si estamos online y hay logs pendientes de este código, sincronizar primero
+          if (isConnected && eventId && !isForcedOffline) {
+            await attemptAutoSync();
+          } else {
+            // Rechazar inmediatamente en modo local como duplicado
+            const dupResult = await registerCodeLocally({
+              code: codeToRegister,
+              type: 'Sistema Externo',
+              details: inheritedZone,
+              max_uses: 1,
+              is_external: true,
+              auto_checkin: autoCheckin,
+              allowedSections,
+              group_name: deviceGroupName,
+            });
+            resetScanner();
+            setLastScannedCode(codeToRegister);
+            setResult(dupResult);
+            playSound(dupResult.status === 'duplicate' ? 'warning' : 'error');
+            Vibration.vibrate([0, 200, 100, 200]);
+            refreshUnsyncedCount();
+            return;
+          }
+        }
+      }
+
       if (isConnected && eventId && !isForcedOffline) {
         try {
           const resp = await registerExternalCode({
             event_id: eventId,
-            code: codeToRegister,
+            code: rawToRegister,
             type: 'Sistema Externo',
             details: inheritedZone,
             max_uses: 1,
             auto_checkin: autoCheckin,
           });
 
-          // Registrar también en DB SQLite local
+          // Sincronizar en SQLite local sin generar log pendiente (sync_only: true)
           await registerCodeLocally({
             code: codeToRegister,
             type: 'Sistema Externo',
             details: inheritedZone,
             max_uses: 1,
             is_external: true,
-            auto_checkin: false,
+            auto_checkin: autoCheckin,
             group_name: deviceGroupName,
             allowedSections,
+            sync_only: true,
           });
-
-          if (autoCheckin) {
-            await updateCodesStatus([
-              {
-                code: codeToRegister,
-                status: 'used',
-                scans_count: 1,
-                inside_count: 1,
-                max_uses: 1,
-                metadata: {
-                  details: inheritedZone,
-                  group_name: deviceGroupName,
-                  allowed_sections: allowedSections || [],
-                },
-              },
-            ]);
-          }
 
           resetScanner();
           setLastScannedCode(codeToRegister);
@@ -1033,7 +943,11 @@ export default function ScannerScreen({ navigation }: any) {
               direction: 'in',
               message: resp.message || `Boleto guardado y acceso concedido: ${codeToRegister}`,
               type: 'Sistema Externo',
-              metadata: { details: inheritedZone, group_name: deviceGroupName },
+              metadata: {
+                section: inheritedZone,
+                details: inheritedZone,
+                group_name: deviceGroupName,
+              },
               scans_count: resp.scans_count ?? 1,
               max_uses: resp.max_uses ?? 1,
               remaining_scans: resp.remaining_scans ?? 0,
@@ -1061,26 +975,68 @@ export default function ScannerScreen({ navigation }: any) {
           refreshUnsyncedCount();
           return;
         } catch (netErr: any) {
-          console.log('Fallo registro online de código externo, procediendo offline:', netErr);
+          console.log('Fallo registro online de código externo:', netErr?.message);
           const errData = netErr.response?.data;
           if (errData && (errData.status === 'duplicate' || errData.status === 'cancelled')) {
+            // Asegurar que la base local SQLite también refleje que este código ya existe
+            const localDbRef = getDb();
+            if (localDbRef) {
+              const existsInLocal = await localDbRef.getFirstAsync<{ code: string }>(
+                'SELECT code FROM codes WHERE code = ?',
+                [codeToRegister]
+              );
+              if (!existsInLocal) {
+                await registerCodeLocally({
+                  code: codeToRegister,
+                  type: errData.type || 'Sistema Externo',
+                  details: inheritedZone,
+                  max_uses: errData.max_uses ?? 1,
+                  is_external: true,
+                  auto_checkin: true,
+                  group_name: deviceGroupName,
+                  allowedSections,
+                  sync_only: true,
+                });
+              }
+              await updateCodesStatus([
+                {
+                  code: codeToRegister,
+                  status: errData.status === 'cancelled' ? 'cancelled' : 'used',
+                  scans_count: errData.scans_count ?? 1,
+                  inside_count: errData.inside_count ?? 1,
+                  max_uses: errData.max_uses ?? 1,
+                  metadata: errData.metadata,
+                },
+              ]);
+            }
+
             resetScanner();
             setLastScannedCode(codeToRegister);
             setResult({
               status: errData.status,
               direction: 'in',
-              message: errData.message,
-              type: 'Sistema Externo',
+              message: errData.message || 'Este código ya fue registrado anteriormente.',
+              type: errData.type || 'Sistema Externo',
+              metadata: errData.metadata,
+              scans_count: errData.scans_count,
+              max_uses: errData.max_uses,
               duplicate_info: errData.duplicate_info,
             });
             playSound(errData.status === 'duplicate' ? 'warning' : 'error');
             Vibration.vibrate([0, 200, 100, 200]);
             return;
           }
+
+          if (netErr.response) {
+            const msg = errData?.message || 'El servidor rechazó el registro de este código.';
+            resetScanner();
+            Alert.alert('No se pudo guardar', msg);
+            return;
+          }
         }
       }
 
-      // Registro Offline en SQLite
+      // Registro Offline en SQLite (solo si no hay conexión o falló la red)
       const localResult = await registerCodeLocally({
         code: codeToRegister,
         type: 'Sistema Externo',
@@ -1095,7 +1051,7 @@ export default function ScannerScreen({ navigation }: any) {
       resetScanner();
       setLastScannedCode(codeToRegister);
 
-      if (autoCheckin) {
+      if (autoCheckin || localResult.status !== 'success') {
         setResult(localResult);
         if (localResult.status === 'success') {
           playSound('success');
@@ -1124,6 +1080,7 @@ export default function ScannerScreen({ navigation }: any) {
       Alert.alert('Error', `No se pudo registrar el código: ${e.message}`);
     } finally {
       setIsSavingExternal(false);
+      isSavingExternalRef.current = false;
       isValidatingRef.current = false;
     }
   };
@@ -1637,7 +1594,7 @@ export default function ScannerScreen({ navigation }: any) {
                 {deviceGroupName || (allowedSections && allowedSections.length > 0 ? allowedSections.join(', ') : 'Acceso Total')}
               </Text>
               <Text style={styles.quickGroupHint}>
-                El código guardado quedará autorizado en esta zona para entrada y salida.
+                El código guardado quedará autorizado en esta zona para entrada y salida (solo se permite guardar 1 vez).
               </Text>
             </View>
 

@@ -2,19 +2,45 @@ import React, { useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, Image, ScrollView } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { CameraView, useCameraPermissions } from 'expo-camera';
-import { loginDevice } from '../services/accessService';
+import { loginDevice, loginDeviceWithCredentials } from '../services/accessService';
 import { colors } from '../theme/colors';
-import { QrCode, X } from 'lucide-react-native';
+import { QrCode, X, KeyRound, UserCheck } from 'lucide-react-native';
 import packageJson from '../../package.json';
 
 const logo = require('../assets/logoBoletea.png');
 
 export default function LoginScreen({ navigation }: any) {
+  const [loginMode, setLoginMode] = useState<'credentials' | 'token'>('credentials');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
   const [deviceIdentifier, setDeviceIdentifier] = useState('');
   const [apiToken, setApiToken] = useState('');
   const [loading, setLoading] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
   const [permission, requestPermission] = useCameraPermissions();
+
+  const handleCredentialsLogin = async () => {
+    const cleanUser = username.trim();
+    if (!cleanUser || !password) {
+      Alert.alert('Error', 'Por favor ingresa tu usuario y contraseña');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const data = await loginDeviceWithCredentials(cleanUser, password);
+      if (data.token) {
+        await AsyncStorage.setItem('scanner_token', data.token);
+        await AsyncStorage.setItem('device_info', JSON.stringify(data.device));
+        navigation.replace('Events');
+      }
+    } catch (error: any) {
+      console.error(error);
+      Alert.alert('Error de acceso', error.response?.data?.message || 'Usuario o contraseña incorrectos');
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handleLogin = async (id?: string, token?: string) => {
     const finalId = id || deviceIdentifier;
@@ -61,15 +87,11 @@ export default function LoginScreen({ navigation }: any) {
         if (config.device_identifier && config.api_token) {
           setDeviceIdentifier(config.device_identifier);
           setApiToken(config.api_token);
-          
-          // Opcional: Podríamos actualizar la URL del servidor aquí si quisiéramos
-          // await AsyncStorage.setItem('server_url', config.server_url);
-          
           handleLogin(config.device_identifier, config.api_token);
           return;
         }
       }
-      
+
       // Formato alternativo simple: IDENTIFIER|TOKEN
       if (data.includes('|')) {
         const [id, token] = data.split('|');
@@ -110,44 +132,100 @@ export default function LoginScreen({ navigation }: any) {
       </View>
 
       <View style={styles.card}>
-        <Text style={styles.subtitle}>Acceso a Dispositivo</Text>
+        <Text style={styles.subtitle}>
+          {loginMode === 'credentials'
+            ? 'Iniciar Sesión con Usuario'
+            : 'Vinculación de Dispositivo'}
+        </Text>
 
-        <TextInput
-          style={styles.input}
-          placeholder="Identificador del Dispositivo"
-          placeholderTextColor={colors.textMuted}
-          value={deviceIdentifier}
-          onChangeText={setDeviceIdentifier}
-          autoCapitalize="none"
-        />
+        {loginMode === 'credentials' ? (
+          <>
+            <TextInput
+              style={styles.input}
+              placeholder="Usuario (ej. puerta1)"
+              placeholderTextColor={colors.textMuted}
+              value={username}
+              onChangeText={setUsername}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
 
-        <TextInput
-          style={styles.input}
-          placeholder="Token API"
-          placeholderTextColor={colors.textMuted}
-          value={apiToken}
-          onChangeText={setApiToken}
-          secureTextEntry
-          autoCapitalize="none"
-        />
+            <TextInput
+              style={styles.input}
+              placeholder="Contraseña"
+              placeholderTextColor={colors.textMuted}
+              value={password}
+              onChangeText={setPassword}
+              secureTextEntry
+              autoCapitalize="none"
+            />
 
-        <TouchableOpacity style={styles.button} onPress={() => handleLogin()} disabled={loading}>
-          {loading ? (
-            <ActivityIndicator color={colors.background} />
+            <TouchableOpacity style={styles.button} onPress={handleCredentialsLogin} disabled={loading}>
+              {loading ? (
+                <ActivityIndicator color={colors.background} />
+              ) : (
+                <Text style={styles.buttonText}>Iniciar Sesión</Text>
+              )}
+            </TouchableOpacity>
+          </>
+        ) : (
+          <>
+            <TextInput
+              style={styles.input}
+              placeholder="Identificador del Dispositivo"
+              placeholderTextColor={colors.textMuted}
+              value={deviceIdentifier}
+              onChangeText={setDeviceIdentifier}
+              autoCapitalize="none"
+            />
+
+            <TextInput
+              style={styles.input}
+              placeholder="Token API"
+              placeholderTextColor={colors.textMuted}
+              value={apiToken}
+              onChangeText={setApiToken}
+              secureTextEntry
+              autoCapitalize="none"
+            />
+
+            <TouchableOpacity style={styles.button} onPress={() => handleLogin()} disabled={loading}>
+              {loading ? (
+                <ActivityIndicator color={colors.background} />
+              ) : (
+                <Text style={styles.buttonText}>Vincular Manualmente</Text>
+              )}
+            </TouchableOpacity>
+
+            <View style={styles.divider}>
+              <View style={styles.line} />
+              <Text style={styles.dividerText}>O</Text>
+              <View style={styles.line} />
+            </View>
+
+            <TouchableOpacity style={styles.qrButton} onPress={handleQrScan} disabled={loading}>
+              <QrCode color={colors.primary} size={24} />
+              <Text style={styles.qrButtonText}>Escanear Código QR</Text>
+            </TouchableOpacity>
+          </>
+        )}
+
+        <TouchableOpacity
+          style={styles.switchModeButton}
+          onPress={() => setLoginMode(loginMode === 'credentials' ? 'token' : 'credentials')}
+          disabled={loading}
+        >
+          {loginMode === 'credentials' ? (
+            <>
+              <KeyRound color={colors.textMuted} size={18} />
+              <Text style={styles.switchModeText}>Entrar con código de vinculación</Text>
+            </>
           ) : (
-            <Text style={styles.buttonText}>Vincular Manualmente</Text>
+            <>
+              <UserCheck color={colors.textMuted} size={18} />
+              <Text style={styles.switchModeText}>Entrar con usuario y contraseña</Text>
+            </>
           )}
-        </TouchableOpacity>
-
-        <View style={styles.divider}>
-          <View style={styles.line} />
-          <Text style={styles.dividerText}>O</Text>
-          <View style={styles.line} />
-        </View>
-
-        <TouchableOpacity style={styles.qrButton} onPress={handleQrScan} disabled={loading}>
-          <QrCode color={colors.primary} size={24} />
-          <Text style={styles.qrButtonText}>Escanear Código QR</Text>
         </TouchableOpacity>
       </View>
       <Text style={styles.versionText}>v{packageJson.version}</Text>
@@ -241,6 +319,24 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: 'bold',
     marginLeft: 10,
+  },
+  switchModeButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 20,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.background,
+    gap: 8,
+  },
+  switchModeText: {
+    color: colors.text,
+    fontSize: 14,
+    fontWeight: '600',
   },
   scannerContainer: {
     flex: 1,

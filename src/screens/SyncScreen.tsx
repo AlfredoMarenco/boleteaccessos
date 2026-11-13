@@ -57,8 +57,26 @@ export default function SyncScreen({ navigation }: any) {
     setDownloadedKB('');
     setSavingStatus('');
     
-    const startTime = Date.now();
     try {
+      const pendingLogs = await getUnsyncedLogs();
+      if (pendingLogs.length > 0) {
+        setSavingStatus(`Sincronizando ${pendingLogs.length} escaneo(s) pendiente(s) antes de descargar...`);
+        const formattedLogs = pendingLogs.map((l) => ({
+          code: l.code,
+          scanned_at: l.scanned_at,
+          direction: l.direction || 'in',
+          override_reason: l.override_reason || null,
+          scan_method: l.scan_method || 'barcode',
+          is_external: l.is_external === 1,
+        }));
+        await syncLogs(event.id, formattedLogs);
+        const ids = pendingLogs.map((l) => l.id);
+        await markLogsAsSynced(ids);
+        setUnsyncedCount(0);
+      }
+
+      setSavingStatus('Descargando base de boletos del servidor...');
+      const startTime = Date.now();
       const data = await syncCodes(event.id, (progressEvent: any) => {
         if (progressEvent.loaded) {
           const kb = (progressEvent.loaded / 1024).toFixed(2);
@@ -92,11 +110,16 @@ export default function SyncScreen({ navigation }: any) {
         Alert.alert('Éxito', `Se descargaron y guardaron ${data.codes.length} boletos para escanear offline.`);
         checkUnsyncedLogs();
       } else {
+        setSavingStatus('');
         Alert.alert('Aviso', 'El evento no tiene boletos registrados.');
       }
     } catch (error: any) {
       console.error(error);
-      const errorMsg = error.response?.data?.message || error.response?.data || error.message || 'Error desconocido';
+      const errorMsg =
+        error.response?.data?.message ||
+        (typeof error.response?.data === 'string' ? error.response.data : null) ||
+        error.message ||
+        'Error desconocido';
       Alert.alert('Error', `No se pudieron descargar los boletos. Detalle: ${errorMsg}`);
     } finally {
       setLoadingDown(false);
@@ -119,6 +142,8 @@ export default function SyncScreen({ navigation }: any) {
         scanned_at: l.scanned_at,
         direction: l.direction || 'in',
         override_reason: l.override_reason || null,
+        scan_method: l.scan_method || 'barcode',
+        is_external: l.is_external === 1,
       }));
 
       const data = await syncLogs(event.id, formattedLogs);

@@ -8,7 +8,7 @@ const API_URL = 'https://boletea.com/api/v1'; // Servidor de Producción
 
 export const api = axios.create({
   baseURL: API_URL,
-  timeout: 3000,
+  timeout: 15000,
   headers: {
     'Content-Type': 'application/json',
     Accept: 'application/json',

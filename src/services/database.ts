@@ -15,6 +15,103 @@ export const getOrOpenDb = async (): Promise<SQLite.SQLiteDatabase> => {
   return await dbInitPromise;
 };
 
+/**
+ * Extrae el código base si es un QR dinámico con formato BLT1.{code}.{window}.{sig12}
+ * Idéntico a SignedTicketQrService en Laravel.
+ */
+export const extractNormalizedCode = (rawScannedString: string): string => {
+  const trimmed = (rawScannedString || '').trim();
+  if (!trimmed.startsWith('BLT1.')) {
+    return trimmed;
+  }
+
+  const parts = trimmed.split('.');
+  if (parts.length >= 4) {
+    parts.pop(); // sig12
+    parts.pop(); // window
+    parts.shift(); // BLT1
+    const extracted = parts.join('.');
+    if (extracted) {
+      return extracted;
+    }
+  } else if (parts.length >= 2 && parts[1]) {
+    return parts[1];
+  }
+
+  return trimmed;
+};
+
+/**
+ * Resuelve la etiqueta legible de zona/sección idéntico a AccessControlController::resolveCodeZoneDisplay
+ */
+export const resolveCodeZoneDisplay = (metadata: any, type?: string | null): string => {
+  const meta = metadata && typeof metadata === 'object' ? metadata : {};
+  for (const key of ['section', 'details', 'category']) {
+    const val = String(meta[key] ?? '').trim();
+    if (val !== '') {
+      return val;
+    }
+  }
+  const typeVal = String(type ?? '').trim();
+  return typeVal !== '' ? typeVal : 'Desconocida';
+};
+
+/**
+ * Comparador de zona/sección insensible a mayúsculas/minúsculas idéntico a AccessControlController::isCodeAllowedInSections
+ */
+export const isCodeAllowedInSections = (
+  metadata: any,
+  type: string | null | undefined,
+  allowedSections: string[] | null | undefined,
+  currentGroupName: string | null | undefined
+): boolean => {
+  if (!allowedSections || !Array.isArray(allowedSections) || allowedSections.length === 0) {
+    return true;
+  }
+
+  const normalizedAllowed = allowedSections
+    .map((s) => String(s ?? '').trim().toLowerCase())
+    .filter((s) => s !== '');
+
+  if (normalizedAllowed.length === 0) {
+    return true;
+  }
+
+  const meta = metadata && typeof metadata === 'object' ? metadata : {};
+  const candidates: string[] = [
+    meta.section,
+    meta.details,
+    meta.category,
+    type,
+    meta.group_name,
+  ]
+    .filter((v) => typeof v === 'string' && v.trim() !== '')
+    .map((v) => String(v).trim());
+
+  if (Array.isArray(meta.allowed_sections)) {
+    for (const extraSec of meta.allowed_sections) {
+      if (typeof extraSec === 'string' && extraSec.trim() !== '') {
+        candidates.push(extraSec.trim());
+      }
+    }
+  }
+
+  for (const candidate of candidates) {
+    if (normalizedAllowed.includes(candidate.toLowerCase())) {
+      return true;
+    }
+  }
+
+  const metaGroup = typeof meta.group_name === 'string' ? meta.group_name.trim().toLowerCase() : '';
+  const groupNameNorm = typeof currentGroupName === 'string' ? currentGroupName.trim().toLowerCase() : '';
+
+  if (metaGroup !== '' && groupNameNorm !== '' && metaGroup === groupNameNorm) {
+    return true;
+  }
+
+  return false;
+};
+
 export const initDatabase = async () => {
   const database = await getOrOpenDb();
 
@@ -36,24 +133,16 @@ export const initDatabase = async () => {
   // Migraciones seguras para bases de datos ya existentes
   try {
     await database.execAsync(`ALTER TABLE codes ADD COLUMN max_uses INTEGER DEFAULT 1;`);
-  } catch (e) {
-    // Columna ya existe
-  }
+  } catch (e) {}
   try {
     await database.execAsync(`ALTER TABLE codes ADD COLUMN scans_count INTEGER DEFAULT 0;`);
-  } catch (e) {
-    // Columna ya existe
-  }
+  } catch (e) {}
   try {
     await database.execAsync(`ALTER TABLE codes ADD COLUMN inside_count INTEGER DEFAULT 0;`);
-  } catch (e) {
-    // Columna ya existe
-  }
+  } catch (e) {}
   try {
     await database.execAsync(`ALTER TABLE codes ADD COLUMN is_external INTEGER DEFAULT 0;`);
-  } catch (e) {
-    // Columna ya existe
-  }
+  } catch (e) {}
 
   // Tabla para registrar cada escaneo localmente antes de sincronizar
   await database.execAsync(`
@@ -64,20 +153,24 @@ export const initDatabase = async () => {
       scanned_at TEXT NOT NULL,
       synced INTEGER DEFAULT 0,
       direction TEXT DEFAULT 'in',
-      override_reason TEXT
+      override_reason TEXT,
+      scan_method TEXT DEFAULT 'barcode',
+      is_external INTEGER DEFAULT 0
     );
   `);
 
   try {
     await database.execAsync(`ALTER TABLE logs ADD COLUMN direction TEXT DEFAULT 'in';`);
-  } catch (e) {
-    // Columna ya existe
-  }
+  } catch (e) {}
   try {
     await database.execAsync(`ALTER TABLE logs ADD COLUMN override_reason TEXT;`);
-  } catch (e) {
-    // Columna ya existe
-  }
+  } catch (e) {}
+  try {
+    await database.execAsync(`ALTER TABLE logs ADD COLUMN scan_method TEXT DEFAULT 'barcode';`);
+  } catch (e) {}
+  try {
+    await database.execAsync(`ALTER TABLE logs ADD COLUMN is_external INTEGER DEFAULT 0;`);
+  } catch (e) {}
 };
 
 export const getDb = () => db;
@@ -90,10 +183,24 @@ export const insertCodesBatch = async (
   const database = await getOrOpenDb();
   if (!database) return;
 
-  // 1. Borrar códigos del evento previo de manera segura
+  // 1. Conservar códigos externos creados localmente que aún no se hayan sincronizado
+  const unsyncedExternalLogs = await database.getAllAsync<{ code: string }>(
+    'SELECT DISTINCT code FROM logs WHERE synced = 0 AND is_external = 1'
+  );
+  const unsyncedExternalCodesSet = new Set(unsyncedExternalLogs.map((r) => r.code));
+
+  let preservedExternals: any[] = [];
+  if (unsyncedExternalCodesSet.size > 0) {
+    const allExternals = await database.getAllAsync<any>(
+      'SELECT code, type, status, metadata, max_uses, scans_count, inside_count, is_external FROM codes WHERE is_external = 1'
+    );
+    preservedExternals = allExternals.filter((row) => unsyncedExternalCodesSet.has(row.code));
+  }
+
+  // 2. Borrar códigos previos de manera segura
   await database.runAsync('DELETE FROM codes');
 
-  // 2. Insertar en lotes (chunks) para no colapsar la memoria nativa ni causar timeout con miles de boletos
+  // 3. Insertar en lotes (chunks) usando INSERT OR REPLACE para evitar fallos por códigos duplicados o status nulo
   const CHUNK_SIZE = 500;
   let processed = 0;
 
@@ -102,19 +209,28 @@ export const insertCodesBatch = async (
 
     await database.withTransactionAsync(async () => {
       const statement = await database.prepareAsync(
-        'INSERT INTO codes (code, type, status, metadata, max_uses, scans_count, inside_count, is_external) VALUES ($code, $type, $status, $metadata, $max_uses, $scans_count, $inside_count, $is_external)'
+        'INSERT OR REPLACE INTO codes (code, type, status, metadata, max_uses, scans_count, inside_count, is_external) VALUES ($code, $type, $status, $metadata, $max_uses, $scans_count, $inside_count, $is_external)'
       );
 
       try {
         for (const c of chunk) {
+          if (!c || !c.code) continue;
+          const cleanCode = String(c.code).trim();
+          if (!cleanCode) continue;
+
+          const serializedMetadata =
+            typeof c.metadata === 'string'
+              ? c.metadata
+              : JSON.stringify(c.metadata || {});
+
           await statement.executeAsync({
-            $code: c.code,
+            $code: cleanCode,
             $type: c.type || 'General',
-            $status: c.status,
-            $metadata: JSON.stringify(c.metadata || {}),
-            $max_uses: c.max_uses ?? 1,
-            $scans_count: c.scans_count ?? 0,
-            $inside_count: c.inside_count ?? 0,
+            $status: c.status || 'pending',
+            $metadata: serializedMetadata,
+            $max_uses: Math.max(1, Number(c.max_uses ?? 1)),
+            $scans_count: Math.max(0, Number(c.scans_count ?? 0)),
+            $inside_count: Math.max(0, Number(c.inside_count ?? 0)),
             $is_external: c.is_external ? 1 : 0,
           });
         }
@@ -129,17 +245,63 @@ export const insertCodesBatch = async (
     }
   }
 
-  // 3. Restaurar escaneos locales y estado de los códigos ya escaneados localmente
-  await database.runAsync(`
-    UPDATE codes 
-    SET scans_count = (SELECT COUNT(*) FROM logs WHERE logs.code = codes.code AND logs.result = 'success' AND (logs.direction IS NULL OR logs.direction = 'in'))
-    WHERE code IN (SELECT code FROM logs WHERE result = 'success')
-  `);
-  await database.runAsync(`
-    UPDATE codes 
-    SET status = 'used' 
-    WHERE scans_count >= max_uses
-  `);
+  // 4. Re-insertar códigos externos locales aún no sincronizados si no venían ya del servidor
+  for (const ext of preservedExternals) {
+    await database.runAsync(
+      'INSERT OR IGNORE INTO codes (code, type, status, metadata, max_uses, scans_count, inside_count, is_external) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [
+        ext.code,
+        ext.type || 'Sistema Externo',
+        ext.status || 'used',
+        typeof ext.metadata === 'string' ? ext.metadata : JSON.stringify(ext.metadata || {}),
+        ext.max_uses ?? 1,
+        ext.scans_count ?? 1,
+        ext.inside_count ?? 1,
+        1,
+      ]
+    );
+  }
+
+  // 5. Aplicar ÚNICAMENTE escaneos locales NO sincronizados (synced = 0 y no externos ya contados) sobre los contadores del servidor
+  const pendingLogs = await database.getAllAsync<{
+    code: string;
+    direction: string | null;
+    is_external: number | null;
+  }>(
+    "SELECT code, direction, is_external FROM logs WHERE synced = 0 AND result = 'success' ORDER BY id ASC"
+  );
+
+  for (const log of pendingLogs) {
+    if (log.is_external === 1) continue; // Ya tiene su estado reflejado al crearse
+    const row = await database.getFirstAsync<{
+      id: number;
+      scans_count: number;
+      inside_count: number;
+      max_uses: number;
+      status: string;
+    }>('SELECT id, scans_count, inside_count, max_uses, status FROM codes WHERE code = ?', [log.code]);
+
+    if (!row) continue;
+
+    const maxUses = Math.max(1, row.max_uses ?? 1);
+    if (log.direction === 'out') {
+      const newInside = Math.max(0, (row.inside_count ?? 0) - 1);
+      const newScans = Math.max(0, (row.scans_count ?? 0) - 1);
+      const newStatus = row.status === 'used' ? 'pending' : row.status;
+      await database.runAsync(
+        'UPDATE codes SET inside_count = ?, scans_count = ?, status = ? WHERE id = ?',
+        [newInside, newScans, newStatus, row.id]
+      );
+    } else {
+      const newScans = (row.scans_count ?? 0) + 1;
+      const newInside = (row.inside_count ?? 0) + 1;
+      const newStatus = newScans >= maxUses ? 'used' : 'pending';
+      await database.runAsync(
+        'UPDATE codes SET inside_count = ?, scans_count = ?, status = ? WHERE id = ?',
+        [newInside, newScans, newStatus, row.id]
+      );
+    }
+  }
 };
 
 export const clearDatabaseForNewEvent = async () => {
@@ -155,19 +317,15 @@ export const validateCodeLocally = async (
   direction: 'in' | 'out' = 'in',
   overrideReason: string | null = null,
   nfcCandidates: string[] = [],
-  currentGroupName: string | null = null
+  currentGroupName: string | null = null,
+  allowZoneOverride: boolean = false,
+  scanMethod: 'barcode' | 'nfc' | 'camera' = 'barcode',
+  allowAssistedZoneOverrideFeature: boolean = true
 ) => {
   const database = await getOrOpenDb();
   if (!database) return { status: 'error', message: 'DB not initialized' };
 
-  // Soporte para QR Dinamico BLT1.{code}.{window}.{sig} cuando opera 100% offline
-  let normalizedCode = codeStr.trim();
-  if (normalizedCode.startsWith('BLT1.')) {
-    const parts = normalizedCode.split('.');
-    if (parts.length >= 2 && parts[1]) {
-      normalizedCode = parts[1];
-    }
-  }
+  const normalizedCode = extractNormalizedCode(codeStr);
 
   let codeRow = await database.getFirstAsync<{
     id: number;
@@ -180,11 +338,11 @@ export const validateCodeLocally = async (
     inside_count: number;
     is_external: number;
   }>(
-    'SELECT id, code, type, status, metadata, max_uses, scans_count, inside_count, is_external FROM codes WHERE code = ?',
-    [normalizedCode]
+    'SELECT id, code, type, status, metadata, max_uses, scans_count, inside_count, is_external FROM codes WHERE code = ? OR LOWER(code) = LOWER(?) LIMIT 1',
+    [normalizedCode, normalizedCode]
   );
 
-  if (!codeRow && nfcCandidates && nfcCandidates.length > 0) {
+  if (!codeRow && scanMethod === 'nfc' && nfcCandidates && nfcCandidates.length > 0) {
     const placeholders = nfcCandidates.map(() => '?').join(',');
     codeRow = await database.getFirstAsync<{
       id: number;
@@ -206,20 +364,25 @@ export const validateCodeLocally = async (
 
   if (!codeRow) {
     await database.runAsync(
-      'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-      [codeStr, 'invalid', scannedAt, direction, overrideReason]
+      'INSERT INTO logs (code, result, scanned_at, direction, override_reason, scan_method) VALUES (?, ?, ?, ?, ?, ?)',
+      [normalizedCode, 'invalid', scannedAt, direction, overrideReason, scanMethod]
     );
-    return { status: 'invalid', message: 'Código no encontrado en el evento.' };
+    return { status: 'invalid', message: 'Código no encontrado.' };
   }
 
-  const effectiveCode = codeRow.code || codeStr;
-  const metadata = JSON.parse(codeRow.metadata || '{}');
+  const effectiveCode = codeRow.code || normalizedCode;
+  let metadata: any = {};
+  try {
+    metadata = JSON.parse(codeRow.metadata || '{}');
+  } catch (e) {
+    metadata = {};
+  }
 
-  // Regla estricta: Si el status es null, vacío, cancelled, denied o sin_acceso -> RECHAZAR de inmediato
+  // Regla estricta idéntica al servidor: si el status es vacío, cancelled, denied, sin_acceso o inactive -> rechazar
   if (!codeRow.status || ['cancelled', 'denied', 'sin_acceso', 'inactive'].includes(codeRow.status.toLowerCase())) {
     await database.runAsync(
-      'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-      [effectiveCode, 'cancelled', scannedAt, direction, overrideReason]
+      'INSERT INTO logs (code, result, scanned_at, direction, override_reason, scan_method) VALUES (?, ?, ?, ?, ?, ?)',
+      [effectiveCode, 'cancelled', scannedAt, direction, overrideReason, scanMethod]
     );
     return {
       status: 'cancelled',
@@ -227,30 +390,30 @@ export const validateCodeLocally = async (
       message: 'Boleto cancelado o sin acceso.',
       type: codeRow.type,
       metadata,
+      seat_flag: metadata?.seat_flag ?? null,
     };
   }
 
-  const maxUses = codeRow.max_uses ?? 1;
-  const currentScans = codeRow.scans_count ?? 0;
-  const currentInside = codeRow.inside_count ?? (currentScans > 0 ? 1 : 0);
+  const maxUses = Math.max(1, Number(codeRow.max_uses ?? 1));
+  const currentScans = Math.max(0, Number(codeRow.scans_count ?? 0));
+  const currentInside = Math.max(0, Number(codeRow.inside_count ?? 0));
 
-  // Zona permitida y herencia de grupo (para entradas y salidas)
-  const codeSection = metadata?.details ?? '';
-  const metaGroup = metadata?.group_name ?? null;
-  const metaSections: string[] = Array.isArray(metadata?.allowed_sections) ? metadata.allowed_sections : [];
-  const isExternal = codeRow.is_external === 1;
+  // Validación de zona idéntica al backend
+  const codeSectionDisplay = resolveCodeZoneDisplay(metadata, codeRow.type);
+  const isAllowedZone = isCodeAllowedInSections(
+    metadata,
+    codeRow.type,
+    allowedSections,
+    currentGroupName
+  );
 
-  const isAllowedZone = !allowedSections || allowedSections.length === 0
-    || (codeSection && allowedSections.includes(codeSection))
-    || (metaGroup && currentGroupName && metaGroup === currentGroupName)
-    || (metaGroup && allowedSections.includes(metaGroup))
-    || (metaSections.length > 0 && metaSections.some((s: string) => allowedSections.includes(s)))
-    || (isExternal && metaGroup && currentGroupName && metaGroup === currentGroupName);
-
-  const hasZoneOverride =
-    overrideReason === 'wheelchair' ||
-    overrideReason === 'wheelchair_assisted_access' ||
-    Boolean(metadata?.assisted_zone_authorized);
+  const hasPriorAssistedAuth = Boolean(metadata?.assisted_zone_authorized);
+  const canOverrideZone =
+    (allowZoneOverride ||
+      hasPriorAssistedAuth ||
+      overrideReason === 'wheelchair' ||
+      overrideReason === 'wheelchair_assisted_access') &&
+    allowAssistedZoneOverrideFeature;
 
   // ----------------------------------------------------
   // MANEJO DE SALIDA (DIRECTION === 'out')
@@ -258,11 +421,12 @@ export const validateCodeLocally = async (
   if (direction === 'out') {
     if (currentInside <= 0) {
       await database.runAsync(
-        'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-        [effectiveCode, 'cannot_exit_not_inside', scannedAt, 'out', overrideReason]
+        'INSERT INTO logs (code, result, scanned_at, direction, override_reason, scan_method) VALUES (?, ?, ?, ?, ?, ?)',
+        [effectiveCode, 'cannot_exit_not_inside', scannedAt, 'out', overrideReason, scanMethod]
       );
       return {
         status: 'cannot_exit_not_inside',
+        direction: 'out',
         matched_code: effectiveCode,
         message: 'No se puede dar salida: este boleto no ha registrado entrada previa.',
         scans_count: currentScans,
@@ -270,27 +434,33 @@ export const validateCodeLocally = async (
         max_uses: maxUses,
         type: codeRow.type,
         metadata,
+        seat_flag: metadata?.seat_flag ?? null,
       };
     }
 
-    if (!hasZoneOverride && !isAllowedZone) {
+    if (!isAllowedZone && !canOverrideZone) {
       await database.runAsync(
-        'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-        [effectiveCode, 'invalid_zone', scannedAt, 'out', overrideReason]
+        'INSERT INTO logs (code, result, scanned_at, direction, override_reason, scan_method) VALUES (?, ?, ?, ?, ?, ?)',
+        [effectiveCode, 'invalid_zone', scannedAt, 'out', overrideReason, scanMethod]
       );
       return {
         status: 'invalid_zone',
         matched_code: effectiveCode,
         direction: 'out',
-        message: `Salida denegada. Este código pertenece a la zona '${codeSection}', la cual no está habilitada para esta puerta.`,
+        message: `Salida denegada. Este código pertenece a la zona '${codeSectionDisplay}', la cual no está habilitada para esta puerta.`,
         type: codeRow.type,
         metadata,
+        seat_flag: metadata?.seat_flag ?? null,
       };
     }
 
     const newInside = Math.max(0, currentInside - 1);
     const newScans = Math.max(0, currentScans - 1);
-    const newStatus = 'pending';
+    const newStatus = codeRow.status === 'used' ? 'pending' : codeRow.status;
+    const effectiveOverride =
+      !isAllowedZone && canOverrideZone
+        ? overrideReason || 'wheelchair_assisted_access'
+        : overrideReason;
 
     await database.runAsync(
       'UPDATE codes SET inside_count = ?, scans_count = ?, status = ? WHERE id = ?',
@@ -298,8 +468,8 @@ export const validateCodeLocally = async (
     );
 
     await database.runAsync(
-      'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-      [effectiveCode, 'success', scannedAt, 'out', overrideReason]
+      'INSERT INTO logs (code, result, scanned_at, direction, override_reason, scan_method) VALUES (?, ?, ?, ?, ?, ?)',
+      [effectiveCode, 'success', scannedAt, 'out', effectiveOverride, scanMethod]
     );
 
     const remaining = Math.max(0, maxUses - newScans);
@@ -311,11 +481,12 @@ export const validateCodeLocally = async (
       message: 'Salida registrada. Puede reingresar.',
       type: codeRow.type,
       metadata,
+      seat_flag: metadata?.seat_flag ?? null,
       scans_count: newScans,
       inside_count: newInside,
       max_uses: maxUses,
       remaining_scans: remaining,
-      override_reason: overrideReason,
+      override_reason: effectiveOverride,
     };
   }
 
@@ -323,15 +494,22 @@ export const validateCodeLocally = async (
   // MANEJO DE ENTRADA (DIRECTION === 'in')
   // ----------------------------------------------------
   if (currentScans >= maxUses || codeRow.status === 'used') {
-    await database.runAsync(
-      'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-      [effectiveCode, 'duplicate', scannedAt, 'in', overrideReason]
+    const lastSuccessLog = await database.getFirstAsync<{ scanned_at: string }>(
+      "SELECT scanned_at FROM logs WHERE code = ? AND result = 'success' AND (direction IS NULL OR direction = 'in') ORDER BY id DESC LIMIT 1",
+      [effectiveCode]
     );
-    const duplicateMsg = maxUses > 1
-      ? `Límite de accesos alcanzado (${currentScans} de ${maxUses}).`
-      : 'Código ya utilizado.';
+
+    await database.runAsync(
+      'INSERT INTO logs (code, result, scanned_at, direction, override_reason, scan_method) VALUES (?, ?, ?, ?, ?, ?)',
+      [effectiveCode, 'duplicate', scannedAt, 'in', overrideReason, scanMethod]
+    );
+    const duplicateMsg =
+      maxUses > 1
+        ? `Límite de accesos alcanzado (${currentScans} de ${maxUses}).`
+        : 'Código ya utilizado.';
     return {
       status: 'duplicate',
+      direction: 'in',
       matched_code: effectiveCode,
       message: duplicateMsg,
       scans_count: currentScans,
@@ -339,24 +517,37 @@ export const validateCodeLocally = async (
       max_uses: maxUses,
       type: codeRow.type,
       metadata,
+      seat_flag: metadata?.seat_flag ?? null,
+      duplicate_info: lastSuccessLog
+        ? {
+            scanned_at: lastSuccessLog.scanned_at,
+            device_name: 'Este Dispositivo',
+          }
+        : undefined,
     };
   }
 
   // Validación offline de zona
-  if (!hasZoneOverride && !isAllowedZone) {
+  if (!isAllowedZone && !canOverrideZone) {
     await database.runAsync(
-      'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-      [effectiveCode, 'invalid_zone', scannedAt, 'in', overrideReason]
+      'INSERT INTO logs (code, result, scanned_at, direction, override_reason, scan_method) VALUES (?, ?, ?, ?, ?, ?)',
+      [effectiveCode, 'invalid_zone', scannedAt, 'in', overrideReason, scanMethod]
     );
     return {
       status: 'invalid_zone',
       matched_code: effectiveCode,
       direction: 'in',
-      message: `Acceso denegado. Este código pertenece a la zona '${codeSection}', la cual no está habilitada para esta puerta.`,
+      message: `Acceso denegado. Este código pertenece a la zona '${codeSectionDisplay}', la cual no está habilitada para esta puerta.`,
       type: codeRow.type,
       metadata,
+      seat_flag: metadata?.seat_flag ?? null,
     };
   }
+
+  const effectiveOverride =
+    !isAllowedZone && canOverrideZone
+      ? overrideReason || 'wheelchair_assisted_access'
+      : overrideReason;
 
   // Éxito: Incrementar contador y marcar como 'used' si llegó al límite
   const newScans = currentScans + 1;
@@ -364,7 +555,7 @@ export const validateCodeLocally = async (
   const isUsed = newScans >= maxUses;
   const newStatus = isUsed ? 'used' : 'pending';
 
-  if (hasZoneOverride) {
+  if (effectiveOverride) {
     metadata.assisted_zone_authorized = true;
   }
 
@@ -373,12 +564,12 @@ export const validateCodeLocally = async (
     [newScans, newInside, newStatus, JSON.stringify(metadata), codeRow.id]
   );
   await database.runAsync(
-    'INSERT INTO logs (code, result, scanned_at, direction, override_reason) VALUES (?, ?, ?, ?, ?)',
-    [effectiveCode, 'success', scannedAt, 'in', overrideReason]
+    'INSERT INTO logs (code, result, scanned_at, direction, override_reason, scan_method) VALUES (?, ?, ?, ?, ?, ?)',
+    [effectiveCode, 'success', scannedAt, 'in', effectiveOverride, scanMethod]
   );
 
   const remaining = Math.max(0, maxUses - newScans);
-  const successMsg = hasZoneOverride
+  const successMsg = effectiveOverride
     ? 'Acceso concedido (Bypass Asistido / Silla de Ruedas).'
     : maxUses > 1
       ? `Acceso ${newScans} de ${maxUses} concedido.`
@@ -391,11 +582,12 @@ export const validateCodeLocally = async (
     message: successMsg,
     type: codeRow.type,
     metadata,
+    seat_flag: metadata?.seat_flag ?? null,
     scans_count: newScans,
     inside_count: newInside,
     max_uses: maxUses,
     remaining_scans: remaining,
-    override_reason: overrideReason,
+    override_reason: effectiveOverride,
   };
 };
 
@@ -408,14 +600,19 @@ export const registerCodeLocally = async (codeData: {
   auto_checkin?: boolean;
   allowedSections?: string[] | null;
   group_name?: string | null;
+  sync_only?: boolean;
 }) => {
   const database = await getOrOpenDb();
   if (!database) return { status: 'error', message: 'DB not initialized' };
 
-  const normalizedCode = codeData.code.trim();
-  const maxUses = codeData.max_uses ?? 1;
+  const normalizedCode = extractNormalizedCode(codeData.code);
+  const maxUses = Math.max(1, Number(codeData.max_uses ?? 1));
   const codeType = codeData.type || 'Sistema Externo';
-  const inheritedZone = codeData.details || codeData.group_name || (codeData.allowedSections && codeData.allowedSections[0]) || 'General';
+  const inheritedZone =
+    codeData.details ||
+    codeData.group_name ||
+    (codeData.allowedSections && codeData.allowedSections[0]) ||
+    'General';
   const metadata = {
     details: inheritedZone,
     group_name: codeData.group_name || null,
@@ -423,99 +620,128 @@ export const registerCodeLocally = async (codeData: {
     source: 'external_quick_registration',
   };
 
-  // Verificar si ya existe en la base SQLite local
+  const scannedAt = new Date().toISOString();
+
+  // Verificar si ya existe en la base SQLite local (insensible a mayúsculas/minúsculas)
   const existing = await database.getFirstAsync<{
     id: number;
     code: string;
+    type: string;
     status: string;
     scans_count: number;
     inside_count: number;
     max_uses: number;
     metadata: string;
   }>(
-    'SELECT id, code, status, scans_count, inside_count, max_uses, metadata FROM codes WHERE code = ?',
-    [normalizedCode]
+    'SELECT id, code, type, status, scans_count, inside_count, max_uses, metadata FROM codes WHERE code = ? OR LOWER(code) = LOWER(?) LIMIT 1',
+    [normalizedCode, normalizedCode]
   );
 
+  // Si solo estamos sincronizando en SQLite un código recién creado exitosamente en el servidor
+  if (codeData.sync_only) {
+    const isUsed = Boolean(codeData.auto_checkin) && maxUses <= 1;
+    await database.runAsync(
+      'INSERT OR REPLACE INTO codes (code, type, status, metadata, max_uses, scans_count, inside_count, is_external) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [
+        normalizedCode,
+        codeType,
+        isUsed ? 'used' : 'pending',
+        JSON.stringify(metadata),
+        maxUses,
+        codeData.auto_checkin ? 1 : 0,
+        codeData.auto_checkin ? 1 : 0,
+        codeData.is_external !== false ? 1 : 0,
+      ]
+    );
+    return { status: 'success', code: normalizedCode };
+  }
+
+  // Regla estricta: NUNCA permitir guardar un código más de 1 vez (aunque esté pending o used)
   if (existing) {
+    let existingMeta: any = {};
+    try {
+      existingMeta = JSON.parse(existing.metadata || '{}');
+    } catch (e) {
+      existingMeta = {};
+    }
+
     if (!existing.status || ['cancelled', 'denied', 'sin_acceso', 'inactive'].includes(existing.status.toLowerCase())) {
+      await database.runAsync(
+        'INSERT INTO logs (code, result, scanned_at, direction, override_reason, is_external) VALUES (?, ?, ?, ?, ?, ?)',
+        [existing.code, 'cancelled', scannedAt, 'in', 'external_registration_attempt', 1]
+      );
       return {
         status: 'cancelled',
-        matched_code: normalizedCode,
+        matched_code: existing.code,
         message: 'Código cancelado o sin acceso.',
-        type: codeType,
-        metadata: JSON.parse(existing.metadata || '{}'),
+        type: existing.type || codeType,
+        metadata: existingMeta,
       };
     }
 
     const currentScans = existing.scans_count ?? 0;
+    const currentInside = existing.inside_count ?? 0;
     const maxExisting = existing.max_uses ?? 1;
 
-    if (currentScans >= maxExisting || existing.status === 'used') {
-      return {
-        status: 'duplicate',
-        matched_code: normalizedCode,
-        message: 'Boleto ya registrado y utilizado previamente.',
-        scans_count: currentScans,
-        max_uses: maxExisting,
-        type: codeType,
-        metadata: JSON.parse(existing.metadata || '{}'),
-      };
-    }
-
-    if (codeData.auto_checkin) {
-      return await validateCodeLocally(
-        normalizedCode,
-        codeData.allowedSections ?? null,
-        'in',
-        'external_quick_checkin_existing',
-        [],
-        codeData.group_name ?? null
-      );
-    }
+    await database.runAsync(
+      'INSERT INTO logs (code, result, scanned_at, direction, override_reason, is_external) VALUES (?, ?, ?, ?, ?, ?)',
+      [existing.code, 'duplicate', scannedAt, 'in', 'external_registration_duplicate', 1]
+    );
 
     return {
       status: 'duplicate',
-      matched_code: normalizedCode,
-      message: 'El código ya se encuentra registrado para este evento.',
+      direction: 'in',
+      matched_code: existing.code,
+      message: 'Este código ya fue guardado o registrado previamente.',
       scans_count: currentScans,
+      inside_count: currentInside,
       max_uses: maxExisting,
+      type: existing.type || codeType,
+      metadata: existingMeta,
     };
   }
 
-  // Insertar nuevo registro
+  const autoCheckin = Boolean(codeData.auto_checkin);
+  const initialScans = autoCheckin ? 1 : 0;
+  const initialInside = autoCheckin ? 1 : 0;
+  const initialStatus = autoCheckin && maxUses <= 1 ? 'used' : 'pending';
+
+  // Insertar nuevo registro y (si auto_checkin) su log en una sola operación
   await database.runAsync(
     'INSERT INTO codes (code, type, status, metadata, max_uses, scans_count, inside_count, is_external) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     [
       normalizedCode,
       codeType,
-      'pending',
+      initialStatus,
       JSON.stringify(metadata),
       maxUses,
-      0,
-      0,
+      initialScans,
+      initialInside,
       codeData.is_external !== false ? 1 : 0,
     ]
   );
 
-  if (codeData.auto_checkin) {
-    return await validateCodeLocally(
-      normalizedCode,
-      codeData.allowedSections ?? null,
-      'in',
-      'external_manual',
-      [],
-      codeData.group_name ?? null
+  if (autoCheckin) {
+    await database.runAsync(
+      'INSERT INTO logs (code, result, scanned_at, direction, override_reason, scan_method, is_external) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [normalizedCode, 'success', scannedAt, 'in', 'external_registration_auto_checkin', 'barcode', 1]
     );
   }
 
   return {
     status: 'success',
-    message: 'Código registrado localmente con éxito.',
+    direction: 'in',
+    matched_code: normalizedCode,
+    message: autoCheckin
+      ? 'Código externo registrado y acceso concedido exitosamente.'
+      : 'Código registrado localmente con éxito.',
     code: normalizedCode,
     type: codeType,
     metadata,
+    scans_count: initialScans,
+    inside_count: initialInside,
     max_uses: maxUses,
+    remaining_scans: Math.max(0, maxUses - initialScans),
   };
 };
 
@@ -529,7 +755,9 @@ export const getUnsyncedLogs = async () => {
     scanned_at: string;
     direction?: string;
     override_reason?: string | null;
-  }>('SELECT id, code, result, scanned_at, direction, override_reason FROM logs WHERE synced = 0');
+    scan_method?: string;
+    is_external?: number;
+  }>('SELECT id, code, result, scanned_at, direction, override_reason, scan_method, is_external FROM logs WHERE synced = 0');
 };
 
 export const markLogsAsSynced = async (ids: number[]) => {
